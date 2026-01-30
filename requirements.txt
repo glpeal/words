@@ -1,0 +1,10 @@
+# TikTok Parser Module Dependencies
+
+# Telegram Bot Framework
+aiogram>=3.0.0
+
+# Async HTTP Client
+aiohttp>=3.8.0
+
+# Optional: для логирования
+# loguru>=0.7.0
