@@ -54,6 +54,39 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 # КОНФИГУРАЦИЯ
 # ============================================
 
+# Папка где лежит скрипт
+SCRIPT_DIR = Path(__file__).parent.absolute()
+
+
+def find_ffmpeg() -> str:
+    """
+    Найти путь к FFmpeg.
+    Сначала ищет в папке со скриптом, потом в системном PATH.
+    """
+    # Возможные имена файла
+    ffmpeg_names = ["ffmpeg.exe", "ffmpeg"]
+
+    # 1. Ищем в папке со скриптом
+    for name in ffmpeg_names:
+        local_path = SCRIPT_DIR / name
+        if local_path.exists():
+            return str(local_path)
+
+    # 2. Ищем в подпапке ffmpeg (если распаковали архив)
+    for subdir in ["ffmpeg", "ffmpeg/bin", "bin"]:
+        for name in ffmpeg_names:
+            local_path = SCRIPT_DIR / subdir / name
+            if local_path.exists():
+                return str(local_path)
+
+    # 3. Ищем в системном PATH
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    return ""
+
+
 class Config:
     # Telegram Bot Token (получить у @BotFather)
     BOT_TOKEN: str = "YOUR_BOT_TOKEN_HERE"
@@ -74,8 +107,8 @@ class Config:
     # Максимальный размер очереди на пользователя
     MAX_QUEUE_PER_USER: int = 100
 
-    # Временная директория для обработки видео
-    TEMP_DIR: str = "/tmp/tiktok_bot"
+    # Временная директория для обработки видео (автоматически для Windows/Linux)
+    TEMP_DIR: str = str(SCRIPT_DIR / "temp_videos")
 
     # Таймаут HTTP запросов (секунды)
     REQUEST_TIMEOUT: int = 60
@@ -88,6 +121,9 @@ class Config:
 
     # Логирование
     LOG_LEVEL: str = "INFO"
+
+    # Путь к FFmpeg (автоматически определяется)
+    FFMPEG_PATH: str = ""
 
 
 # Настройка логирования
@@ -160,9 +196,10 @@ class VideoUniqueizer:
     - Невидимый водяной знак
     """
 
-    def __init__(self, temp_dir: str = "/tmp/tiktok_bot"):
+    def __init__(self, temp_dir: str, ffmpeg_path: str = "ffmpeg"):
         self.temp_dir = Path(temp_dir)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.ffmpeg_path = ffmpeg_path
         self._semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_FFMPEG)
 
     async def uniqueize(self, input_path: str, output_path: Optional[str] = None) -> Optional[str]:
@@ -305,7 +342,7 @@ class VideoUniqueizer:
         ]
 
         cmd = [
-            "ffmpeg",
+            self.ffmpeg_path,
             "-y",  # Перезаписывать файлы
             "-i", input_path,
 
@@ -701,7 +738,7 @@ def get_cancel_keyboard() -> InlineKeyboardMarkup:
 class TikTokBot:
     """Основной класс бота"""
 
-    def __init__(self, token: str, storage_chat_id: int):
+    def __init__(self, token: str, storage_chat_id: int, ffmpeg_path: str = "ffmpeg"):
         self.bot = Bot(token=token)
         self.dp = Dispatcher(storage=MemoryStorage())
         self.router = Router()
@@ -709,7 +746,7 @@ class TikTokBot:
 
         # Компоненты
         self.downloader = TikTokDownloader(Config.TEMP_DIR)
-        self.uniqueizer = VideoUniqueizer(Config.TEMP_DIR)
+        self.uniqueizer = VideoUniqueizer(Config.TEMP_DIR, ffmpeg_path)
         self.queue_manager = QueueManager(self.bot, self.downloader, self.uniqueizer)
 
         # Настройка хэндлеров
@@ -1123,22 +1160,31 @@ def main():
         print("=" * 50)
         return
 
-    # Проверка FFmpeg
-    if shutil.which("ffmpeg") is None:
+    # Поиск FFmpeg
+    ffmpeg_path = find_ffmpeg()
+
+    if not ffmpeg_path:
         print("=" * 50)
-        print("ОШИБКА: FFmpeg не установлен!")
+        print("ОШИБКА: FFmpeg не найден!")
         print()
-        print("Установите FFmpeg:")
+        print("Положите ffmpeg.exe в папку со скриптом:")
+        print(f"  {SCRIPT_DIR}")
+        print()
+        print("Или установите FFmpeg в систему:")
+        print("  Windows: скачайте с ffmpeg.org и распакуйте")
         print("  Ubuntu/Debian: sudo apt install ffmpeg")
         print("  macOS: brew install ffmpeg")
-        print("  Windows: скачайте с ffmpeg.org")
         print("=" * 50)
         return
+
+    print(f"FFmpeg найден: {ffmpeg_path}")
+    Config.FFMPEG_PATH = ffmpeg_path
 
     # Запуск бота
     bot = TikTokBot(
         token=Config.BOT_TOKEN,
-        storage_chat_id=Config.STORAGE_CHAT_ID
+        storage_chat_id=Config.STORAGE_CHAT_ID,
+        ffmpeg_path=ffmpeg_path
     )
 
     asyncio.run(bot.start())
