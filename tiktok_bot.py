@@ -125,6 +125,12 @@ class Config:
     # Путь к FFmpeg (автоматически определяется)
     FFMPEG_PATH: str = ""
 
+    # Время хранения видео в storage группе (секунды) - 10 минут
+    STORAGE_VIDEO_TTL: int = 600
+
+    # Файл для сохранения кэша видео
+    CACHE_FILE: str = str(SCRIPT_DIR / "video_cache.json")
+
 
 # Настройка логирования
 logging.basicConfig(
@@ -160,7 +166,9 @@ class VideoTask:
     video_url: Optional[str] = None
     file_id: Optional[str] = None
     file_path: Optional[str] = None
+    video_id: str = ""  # ID видео TikTok для кэширования
     author: str = ""
+    author_id: str = ""
     title: str = ""
     status: str = "pending"  # pending, downloading, processing, sending, done, error
     error_message: str = ""
@@ -177,6 +185,122 @@ class UserQueue:
     user_id: int
     tasks: List[VideoTask] = field(default_factory=list)
     is_processing: bool = False
+
+
+@dataclass
+class CachedVideo:
+    """Информация о кэшированном видео"""
+    video_id: str  # ID видео TikTok
+    video_url: str  # URL для скачивания
+    author_id: str  # ID автора
+    title: str
+    file_id: str  # Telegram file_id для быстрой пересылки
+    cached_at: str  # ISO timestamp
+    user_id: int  # Кому отправлялось
+
+
+# ============================================
+# VIDEO CACHE
+# ============================================
+
+class VideoCache:
+    """
+    Кэш отправленных видео для предотвращения повторов.
+    Сохраняется в JSON файл для персистентности.
+    """
+
+    def __init__(self, cache_file: str):
+        self.cache_file = Path(cache_file)
+        self._cache: Dict[str, CachedVideo] = {}  # video_id -> CachedVideo
+        self._user_videos: Dict[int, set] = {}  # user_id -> set of video_ids
+        self._load_cache()
+
+    def _load_cache(self):
+        """Загрузить кэш из файла"""
+        try:
+            if self.cache_file.exists():
+                import json
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                for video_id, video_data in data.get("videos", {}).items():
+                    self._cache[video_id] = CachedVideo(**video_data)
+
+                    user_id = video_data.get("user_id", 0)
+                    if user_id not in self._user_videos:
+                        self._user_videos[user_id] = set()
+                    self._user_videos[user_id].add(video_id)
+
+                logger.info(f"Loaded {len(self._cache)} videos from cache")
+        except Exception as e:
+            logger.warning(f"Failed to load cache: {e}")
+
+    def _save_cache(self):
+        """Сохранить кэш в файл"""
+        try:
+            import json
+            data = {
+                "videos": {
+                    vid: {
+                        "video_id": v.video_id,
+                        "video_url": v.video_url,
+                        "author_id": v.author_id,
+                        "title": v.title,
+                        "file_id": v.file_id,
+                        "cached_at": v.cached_at,
+                        "user_id": v.user_id
+                    }
+                    for vid, v in self._cache.items()
+                }
+            }
+            with open(self.cache_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save cache: {e}")
+
+    def add(self, video_id: str, video_url: str, author_id: str, title: str,
+            file_id: str, user_id: int):
+        """Добавить видео в кэш"""
+        cached = CachedVideo(
+            video_id=video_id,
+            video_url=video_url,
+            author_id=author_id,
+            title=title,
+            file_id=file_id,
+            cached_at=datetime.now().isoformat(),
+            user_id=user_id
+        )
+        self._cache[video_id] = cached
+
+        if user_id not in self._user_videos:
+            self._user_videos[user_id] = set()
+        self._user_videos[user_id].add(video_id)
+
+        self._save_cache()
+        logger.debug(f"Cached video {video_id} for user {user_id}")
+
+    def is_sent_to_user(self, video_id: str, user_id: int) -> bool:
+        """Проверить, было ли видео отправлено пользователю"""
+        if user_id not in self._user_videos:
+            return False
+        return video_id in self._user_videos[user_id]
+
+    def get_file_id(self, video_id: str) -> Optional[str]:
+        """Получить file_id из кэша"""
+        cached = self._cache.get(video_id)
+        return cached.file_id if cached else None
+
+    def filter_new_videos(self, videos: List[Dict[str, Any]], user_id: int) -> List[Dict[str, Any]]:
+        """Отфильтровать уже отправленные пользователю видео"""
+        return [v for v in videos if not self.is_sent_to_user(v.get("video_id", ""), user_id)]
+
+    def get_stats(self, user_id: int) -> Dict[str, int]:
+        """Получить статистику кэша для пользователя"""
+        user_count = len(self._user_videos.get(user_id, set()))
+        return {
+            "total": len(self._cache),
+            "user": user_count
+        }
 
 
 # ============================================
@@ -532,12 +656,16 @@ class TikTokDownloader:
 class QueueManager:
     """Менеджер очередей для обработки видео"""
 
-    def __init__(self, bot: Bot, downloader: TikTokDownloader, uniqueizer: VideoUniqueizer):
+    def __init__(self, bot: Bot, downloader: TikTokDownloader, uniqueizer: VideoUniqueizer,
+                 storage_chat_id: int, video_cache: VideoCache):
         self.bot = bot
         self.downloader = downloader
         self.uniqueizer = uniqueizer
+        self.storage_chat_id = storage_chat_id
+        self.video_cache = video_cache
         self._user_queues: Dict[int, UserQueue] = {}
         self._processing_tasks: Dict[int, asyncio.Task] = {}
+        self._delete_tasks: List[asyncio.Task] = []  # Задачи на удаление из storage
 
     def get_user_queue(self, user_id: int) -> UserQueue:
         """Получить очередь пользователя"""
@@ -616,6 +744,7 @@ class QueueManager:
         """Обработать одну задачу"""
         downloaded_path = None
         unique_path = None
+        video_id = task.video_id or str(uuid.uuid4())[:12]
 
         try:
             # Шаг 1: Скачивание
@@ -645,28 +774,71 @@ class QueueManager:
                 await self._send_error(task)
                 return
 
-            # Шаг 3: Отправка
+            # Шаг 3: Отправка в storage группу с хэштегами
             task.status = "sending"
 
-            caption_parts = []
-            if task.author:
-                caption_parts.append(f"🎬 {task.author}")
-            if task.title:
-                caption_parts.append(task.title[:200])
-            caption_parts.append("✅ Уникализировано")
-
-            caption = "\n".join(caption_parts)
+            # Формируем caption для storage с хэштегами
+            author_id = task.author_id or 'unknown'
+            storage_caption = (
+                f"#vid #cache\n"
+                f"📹 ID: {video_id}\n"
+                f"👤 Author: @{author_id}\n"
+                f"🔗 URL: {task.video_url or 'file'}\n"
+                f"👥 User: {task.user_id}"
+            )
 
             video_file = FSInputFile(unique_path)
+
+            # Отправляем в storage группу
+            storage_msg = await self.bot.send_video(
+                chat_id=self.storage_chat_id,
+                video=video_file,
+                caption=storage_caption,
+                supports_streaming=True,
+                disable_notification=True
+            )
+
+            file_id = storage_msg.video.file_id
+
+            # Добавляем в кэш
+            self.video_cache.add(
+                video_id=video_id,
+                video_url=task.video_url or "",
+                author_id=author_id,
+                title=task.title,
+                file_id=file_id,
+                user_id=task.user_id
+            )
+
+            # Формируем caption для пользователя
+            user_caption_parts = []
+            if task.author:
+                user_caption_parts.append(f"🎬 {task.author}")
+            if task.title:
+                user_caption_parts.append(task.title[:200])
+            user_caption_parts.append("✅ Уникализировано")
+            user_caption = "\n".join(user_caption_parts)
+
+            # Отправляем пользователю через file_id (быстро, без повторной загрузки)
             await self.bot.send_video(
                 chat_id=task.chat_id,
-                video=video_file,
-                caption=caption,
+                video=file_id,
+                caption=user_caption,
                 supports_streaming=True
             )
 
+            # Планируем удаление из storage через 10 минут
+            delete_task = asyncio.create_task(
+                self._delete_from_storage_delayed(
+                    self.storage_chat_id,
+                    storage_msg.message_id,
+                    Config.STORAGE_VIDEO_TTL
+                )
+            )
+            self._delete_tasks.append(delete_task)
+
             task.status = "done"
-            logger.info(f"Task {task.task_id} completed successfully")
+            logger.info(f"Task {task.task_id} completed successfully, cached as {video_id}")
 
         except Exception as e:
             logger.error(f"Error processing task {task.task_id}: {e}")
@@ -680,6 +852,15 @@ class QueueManager:
                 await self.uniqueizer.cleanup_file(downloaded_path)
             if unique_path:
                 await self.uniqueizer.cleanup_file(unique_path)
+
+    async def _delete_from_storage_delayed(self, chat_id: int, message_id: int, delay: int):
+        """Удалить сообщение из storage через delay секунд"""
+        try:
+            await asyncio.sleep(delay)
+            await self.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            logger.debug(f"Deleted message {message_id} from storage after {delay}s")
+        except Exception as e:
+            logger.warning(f"Failed to delete message {message_id} from storage: {e}")
 
     async def _send_error(self, task: VideoTask):
         """Отправить сообщение об ошибке"""
@@ -747,7 +928,11 @@ class TikTokBot:
         # Компоненты
         self.downloader = TikTokDownloader(Config.TEMP_DIR)
         self.uniqueizer = VideoUniqueizer(Config.TEMP_DIR, ffmpeg_path)
-        self.queue_manager = QueueManager(self.bot, self.downloader, self.uniqueizer)
+        self.video_cache = VideoCache(Config.CACHE_FILE)
+        self.queue_manager = QueueManager(
+            self.bot, self.downloader, self.uniqueizer,
+            storage_chat_id, self.video_cache
+        )
 
         # Настройка хэндлеров
         self._setup_handlers()
@@ -976,6 +1161,7 @@ class TikTokBot:
                 chat_id=message.chat.id,
                 video_url=info["video_url"],
                 author=info.get("author", ""),
+                author_id=info.get("author_id", ""),
                 title=info.get("title", "")
             )
 
@@ -1045,6 +1231,7 @@ class TikTokBot:
                 chat_id=callback.message.chat.id,
                 video_url=info["video_url"],
                 author=info.get("author", ""),
+                author_id=info.get("author_id", ""),
                 title=info.get("title", "")
             )
 
@@ -1068,8 +1255,9 @@ class TikTokBot:
     ):
         """Запустить парсинг видео"""
         try:
-            # Поиск видео
-            videos = await self.downloader.search_videos(query, count)
+            # Поиск видео (запрашиваем больше, чтобы отфильтровать уже отправленные)
+            search_count = min(count * 2, 100)  # Ищем в 2 раза больше
+            videos = await self.downloader.search_videos(query, search_count)
 
             if not videos:
                 await status_message.edit_text(
@@ -1080,31 +1268,53 @@ class TikTokBot:
                 await state.clear()
                 return
 
+            # Фильтруем уже отправленные пользователю видео
+            new_videos = self.video_cache.filter_new_videos(videos, user_id)
+
+            if not new_videos:
+                cache_stats = self.video_cache.get_stats(user_id)
+                await status_message.edit_text(
+                    f"😔 По запросу **{query}** все найденные видео уже были отправлены.\n\n"
+                    f"📊 В кэше: {cache_stats['user']} ваших видео\n"
+                    f"Попробуйте другой запрос.",
+                    parse_mode="Markdown"
+                )
+                await state.clear()
+                return
+
+            # Берем нужное количество новых видео
+            videos_to_send = new_videos[:count]
+
             await status_message.edit_text(
-                f"✅ Найдено **{len(videos)}** видео!\n\n"
+                f"✅ Найдено **{len(videos_to_send)}** новых видео!\n"
+                f"(пропущено {len(videos) - len(new_videos)} уже отправленных)\n\n"
                 f"Добавляю в очередь на обработку...",
                 parse_mode="Markdown"
             )
 
             # Добавляем задачи в очередь
             added = 0
-            for video in videos:
+            for video in videos_to_send:
                 task = VideoTask(
                     task_id="",
                     user_id=user_id,
                     chat_id=status_message.chat.id,
                     video_url=video["video_url"],
+                    video_id=video.get("video_id", ""),
                     author=video.get("author", ""),
+                    author_id=video.get("author_id", ""),
                     title=video.get("title", "")
                 )
 
                 if self.queue_manager.add_task(task):
                     added += 1
 
+            cache_stats = self.video_cache.get_stats(user_id)
             await status_message.edit_text(
                 f"✅ **Готово!**\n\n"
                 f"🔍 Запрос: {query}\n"
-                f"📦 Добавлено в очередь: {added} видео\n\n"
+                f"📦 Добавлено в очередь: {added} видео\n"
+                f"💾 В кэше: {cache_stats['user']} ваших видео\n\n"
                 f"Видео будут обработаны и отправлены по мере готовности.\n"
                 f"Проверить статус: 📊 Статус очереди",
                 parse_mode="Markdown"
