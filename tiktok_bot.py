@@ -178,6 +178,8 @@ class VideoTask:
     author_id: str = ""
     title: str = ""
     use_blur_background: bool = False  # Использовать размытый фон
+    skip_uniqueization: bool = False  # Пропустить уникализацию (только скачать)
+    do_uniqueize: bool = False  # Выполнить только уникализацию (из очереди)
     status: str = "pending"  # pending, downloading, processing, sending, done, error
     error_message: str = ""
     created_at: datetime = field(default_factory=datetime.now)
@@ -238,6 +240,38 @@ class UserSettings:
     def set_blur_background(self, user_id: int, value: bool):
         """Установить настройку размытого фона"""
         self.set(user_id, "blur_background", value)
+
+    def get_unique_queue(self, user_id: int) -> List[Dict[str, Any]]:
+        """Получить очередь на уникализацию"""
+        return self.get(user_id, "unique_queue", [])
+
+    def add_to_unique_queue(self, user_id: int, video_data: Dict[str, Any]) -> bool:
+        """Добавить видео в очередь на уникализацию"""
+        queue = self.get_unique_queue(user_id)
+        # Проверяем, что видео еще не в очереди
+        for v in queue:
+            if v.get("file_id") == video_data.get("file_id"):
+                return False
+        queue.append(video_data)
+        self.set(user_id, "unique_queue", queue)
+        return True
+
+    def remove_from_unique_queue(self, user_id: int, file_id: str) -> bool:
+        """Удалить видео из очереди на уникализацию"""
+        queue = self.get_unique_queue(user_id)
+        new_queue = [v for v in queue if v.get("file_id") != file_id]
+        if len(new_queue) != len(queue):
+            self.set(user_id, "unique_queue", new_queue)
+            return True
+        return False
+
+    def clear_unique_queue(self, user_id: int):
+        """Очистить очередь на уникализацию"""
+        self.set(user_id, "unique_queue", [])
+
+    def get_unique_queue_count(self, user_id: int) -> int:
+        """Получить количество видео в очереди на уникализацию"""
+        return len(self.get_unique_queue(user_id))
 
 
 @dataclass
@@ -776,12 +810,13 @@ class QueueManager:
     """Менеджер очередей для обработки видео"""
 
     def __init__(self, bot: Bot, downloader: TikTokDownloader, uniqueizer: VideoUniqueizer,
-                 storage_chat_id: int, video_cache: VideoCache):
+                 storage_chat_id: int, video_cache: VideoCache, user_settings: 'UserSettings' = None):
         self.bot = bot
         self.downloader = downloader
         self.uniqueizer = uniqueizer
         self.storage_chat_id = storage_chat_id
         self.video_cache = video_cache
+        self.user_settings = user_settings
         self._user_queues: Dict[int, UserQueue] = {}
         self._processing_tasks: Dict[int, asyncio.Task] = {}
         self._delete_tasks: List[asyncio.Task] = []  # Задачи на удаление из storage
@@ -866,6 +901,11 @@ class QueueManager:
         video_id = task.video_id or str(uuid.uuid4())[:12]
 
         try:
+            # Режим: только уникализация из очереди (file_id уже есть)
+            if task.do_uniqueize and task.file_id:
+                await self._process_uniqueize_only(task)
+                return
+
             # Шаг 1: Скачивание
             task.status = "downloading"
 
@@ -883,7 +923,12 @@ class QueueManager:
                 await self._send_error(task)
                 return
 
-            # Шаг 2: Уникализация
+            # Режим: только скачивание (для парсера - без уникализации)
+            if task.skip_uniqueization:
+                await self._process_download_only(task, downloaded_path, video_id)
+                return
+
+            # Шаг 2: Уникализация (стандартный режим)
             task.status = "processing"
             unique_path = await self.uniqueizer.uniqueize(
                 downloaded_path,
@@ -975,6 +1020,201 @@ class QueueManager:
             if unique_path:
                 await self.uniqueizer.cleanup_file(unique_path)
 
+    async def _process_download_only(self, task: VideoTask, downloaded_path: str, video_id: str):
+        """Обработка только скачивания (без уникализации) - для парсера"""
+        try:
+            task.status = "sending"
+
+            # Формируем caption для storage с хэштегами
+            author_id = task.author_id or 'unknown'
+            storage_caption = (
+                f"#vid #download\n"
+                f"📹 ID: {video_id}\n"
+                f"👤 Author: @{author_id}\n"
+                f"🔗 URL: {task.video_url or 'file'}\n"
+                f"👥 User: {task.user_id}"
+            )
+
+            video_file = FSInputFile(downloaded_path)
+
+            # Отправляем в storage группу
+            storage_msg = await self.bot.send_video(
+                chat_id=self.storage_chat_id,
+                video=video_file,
+                caption=storage_caption,
+                supports_streaming=True,
+                disable_notification=True
+            )
+
+            file_id = storage_msg.video.file_id
+
+            # Добавляем в кэш
+            self.video_cache.add(
+                video_id=video_id,
+                video_url=task.video_url or "",
+                author_id=author_id,
+                title=task.title,
+                file_id=file_id,
+                user_id=task.user_id
+            )
+
+            # Формируем caption для пользователя с предложением уникализации
+            user_caption_parts = []
+            if task.author:
+                user_caption_parts.append(f"🎬 {task.author}")
+            if task.title:
+                user_caption_parts.append(task.title[:200])
+            user_caption_parts.append("\n📥 Скачано без водяного знака")
+            user_caption_parts.append("➡️ Добавить в список уникализаций?")
+            user_caption = "\n".join(user_caption_parts)
+
+            # Инлайн кнопки для добавления в очередь уникализации
+            builder = InlineKeyboardBuilder()
+            # Сохраняем file_id и метаданные в callback_data (ограничение 64 байта)
+            # Используем короткий формат: uq:file_id[:20]:author_id[:15]
+            short_file_id = file_id[:40]  # Урезаем file_id
+            builder.button(text="✅ Да, уникализировать", callback_data=f"uq_add:{short_file_id}")
+            builder.button(text="❌ Нет", callback_data=f"uq_skip:{short_file_id}")
+            builder.adjust(1)
+
+            # Отправляем пользователю через file_id с кнопками
+            sent_msg = await self.bot.send_video(
+                chat_id=task.chat_id,
+                video=file_id,
+                caption=user_caption,
+                reply_markup=builder.as_markup(),
+                supports_streaming=True
+            )
+
+            # Сохраняем данные видео для callback (через user_settings)
+            if self.user_settings:
+                # Временное хранение данных видео по short_file_id
+                video_data = {
+                    "file_id": file_id,
+                    "author": task.author,
+                    "author_id": author_id,
+                    "title": task.title,
+                    "video_id": video_id,
+                    "message_id": sent_msg.message_id
+                }
+                pending_key = f"pending_video_{short_file_id}"
+                self.user_settings.set(task.user_id, pending_key, video_data)
+
+            # Планируем удаление из storage через 10 минут
+            delete_task = asyncio.create_task(
+                self._delete_from_storage_delayed(
+                    self.storage_chat_id,
+                    storage_msg.message_id,
+                    Config.STORAGE_VIDEO_TTL
+                )
+            )
+            self._delete_tasks.append(delete_task)
+
+            task.status = "done"
+            logger.info(f"Task {task.task_id} downloaded (no unique), cached as {video_id}")
+
+        except Exception as e:
+            logger.error(f"Error in download-only task {task.task_id}: {e}")
+            task.status = "error"
+            task.error_message = str(e)
+            await self._send_error(task)
+        finally:
+            # Очистка скачанного файла
+            await self.uniqueizer.cleanup_file(downloaded_path)
+
+    async def _process_uniqueize_only(self, task: VideoTask):
+        """Обработка только уникализации (видео уже в Telegram)"""
+        downloaded_path = None
+        unique_path = None
+
+        try:
+            task.status = "downloading"
+
+            # Скачиваем файл из Telegram
+            downloaded_path = str(self.uniqueizer.temp_dir / f"tg_{uuid.uuid4().hex[:8]}.mp4")
+            file = await self.bot.get_file(task.file_id)
+            await self.bot.download_file(file.file_path, downloaded_path)
+
+            # Уникализация
+            task.status = "processing"
+            unique_path = await self.uniqueizer.uniqueize(
+                downloaded_path,
+                use_blur_background=task.use_blur_background
+            )
+
+            if not unique_path:
+                task.status = "error"
+                task.error_message = "Не удалось обработать видео"
+                await self._send_error(task)
+                return
+
+            task.status = "sending"
+
+            # Формируем caption для storage
+            video_id = task.video_id or str(uuid.uuid4())[:12]
+            author_id = task.author_id or 'unknown'
+            storage_caption = (
+                f"#vid #unique\n"
+                f"📹 ID: {video_id}\n"
+                f"👤 Author: @{author_id}\n"
+                f"👥 User: {task.user_id}"
+            )
+
+            video_file = FSInputFile(unique_path)
+
+            # Отправляем в storage группу
+            storage_msg = await self.bot.send_video(
+                chat_id=self.storage_chat_id,
+                video=video_file,
+                caption=storage_caption,
+                supports_streaming=True,
+                disable_notification=True
+            )
+
+            unique_file_id = storage_msg.video.file_id
+
+            # Формируем caption для пользователя
+            user_caption_parts = []
+            if task.author:
+                user_caption_parts.append(f"🎬 {task.author}")
+            if task.title:
+                user_caption_parts.append(task.title[:150])
+            user_caption_parts.append("✅ Уникализировано")
+            user_caption = "\n".join(user_caption_parts)
+
+            # Отправляем пользователю
+            await self.bot.send_video(
+                chat_id=task.chat_id,
+                video=unique_file_id,
+                caption=user_caption,
+                supports_streaming=True
+            )
+
+            # Планируем удаление из storage
+            delete_task = asyncio.create_task(
+                self._delete_from_storage_delayed(
+                    self.storage_chat_id,
+                    storage_msg.message_id,
+                    Config.STORAGE_VIDEO_TTL
+                )
+            )
+            self._delete_tasks.append(delete_task)
+
+            task.status = "done"
+            logger.info(f"Task {task.task_id} uniqueized successfully")
+
+        except Exception as e:
+            logger.error(f"Error in uniqueize-only task {task.task_id}: {e}")
+            task.status = "error"
+            task.error_message = str(e)
+            await self._send_error(task)
+
+        finally:
+            if downloaded_path:
+                await self.uniqueizer.cleanup_file(downloaded_path)
+            if unique_path:
+                await self.uniqueizer.cleanup_file(unique_path)
+
     async def _delete_from_storage_delayed(self, chat_id: int, message_id: int, delay: int):
         """Удалить сообщение из storage через delay секунд"""
         try:
@@ -1057,7 +1297,7 @@ class TikTokBot:
         self.user_settings = UserSettings()
         self.queue_manager = QueueManager(
             self.bot, self.downloader, self.uniqueizer,
-            storage_chat_id, self.video_cache
+            storage_chat_id, self.video_cache, self.user_settings
         )
 
         # Настройка хэндлеров
@@ -1071,13 +1311,17 @@ class TikTokBot:
         @self.router.message(CommandStart())
         async def cmd_start(message: Message, state: FSMContext):
             await state.clear()
+            queue_count = self.user_settings.get_unique_queue_count(message.from_user.id)
+            queue_info = f"\n\n📋 В очереди на уникализацию: {queue_count}" if queue_count > 0 else ""
+
             await message.answer(
                 "👋 **Привет!**\n\n"
                 "Я бот для парсинга и уникализации видео с TikTok.\n\n"
-                "**Возможности:**\n"
-                "🎬 Парсер - поиск и скачивание видео по запросу\n"
-                "🔄 Уникализация - обработка видео для соцсетей\n\n"
-                "Выберите действие:",
+                "**Как пользоваться:**\n"
+                "1️⃣ 🎬 Парсер - скачать видео по запросу\n"
+                "2️⃣ Выбрать какие видео уникализировать\n"
+                "3️⃣ 🔄 Уникализация - обработать выбранные\n\n"
+                f"Выберите действие:{queue_info}",
                 reply_markup=get_main_keyboard(),
                 parse_mode="Markdown"
             )
@@ -1097,14 +1341,35 @@ class TikTokBot:
         # Главное меню - Уникализация
         @self.router.message(F.text == "🔄 Уникализация")
         async def menu_uniqueize(message: Message, state: FSMContext):
-            await state.set_state(BotStates.waiting_video_for_unique)
+            queue_count = self.user_settings.get_unique_queue_count(message.from_user.id)
+
+            builder = InlineKeyboardBuilder()
+            if queue_count > 0:
+                builder.button(
+                    text=f"🚀 Уникализировать все ({queue_count} видео)",
+                    callback_data="uniqueize_all"
+                )
+                builder.button(
+                    text="🗑️ Очистить очередь",
+                    callback_data="clear_unique_queue"
+                )
+            builder.button(text="📤 Отправить видео вручную", callback_data="send_video_manual")
+            builder.button(text="❌ Отмена", callback_data="cancel")
+            builder.adjust(1)
+
+            queue_info = ""
+            if queue_count > 0:
+                queue_info = f"\n\n📋 **В очереди на уникализацию:** {queue_count} видео"
+
             await message.answer(
                 "🔄 **Уникализация видео**\n\n"
-                "Отправьте видео или ссылку на TikTok.\n"
-                "Можно отправить сразу несколько видео!\n\n"
+                "Здесь вы можете:\n"
+                "• Уникализировать видео из очереди парсера\n"
+                "• Отправить свое видео вручную\n\n"
                 "Видео будет обработано и возвращено с изменениями,\n"
-                "невидимыми для глаза, но уникальными для соцсетей.",
-                reply_markup=get_cancel_keyboard(),
+                "невидимыми для глаза, но уникальными для соцсетей."
+                f"{queue_info}",
+                reply_markup=builder.as_markup(),
                 parse_mode="Markdown"
             )
 
@@ -1202,6 +1467,128 @@ class TikTokBot:
             )
             await callback.answer()
 
+        # Добавить видео в очередь уникализации
+        @self.router.callback_query(F.data.startswith("uq_add:"))
+        async def add_to_unique_queue(callback: CallbackQuery):
+            short_file_id = callback.data.split(":", 1)[1]
+            pending_key = f"pending_video_{short_file_id}"
+            video_data = self.user_settings.get(callback.from_user.id, pending_key)
+
+            if not video_data:
+                await callback.answer("❌ Видео не найдено", show_alert=True)
+                return
+
+            # Добавляем в очередь
+            if self.user_settings.add_to_unique_queue(callback.from_user.id, video_data):
+                queue_count = self.user_settings.get_unique_queue_count(callback.from_user.id)
+                # Обновляем caption сообщения
+                new_caption_parts = []
+                if video_data.get("author"):
+                    new_caption_parts.append(f"🎬 {video_data['author']}")
+                if video_data.get("title"):
+                    new_caption_parts.append(video_data["title"][:200])
+                new_caption_parts.append(f"\n✅ Добавлено в очередь уникализации ({queue_count} шт)")
+                new_caption = "\n".join(new_caption_parts)
+
+                try:
+                    await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+                except Exception:
+                    pass
+
+                await callback.answer(f"✅ Добавлено! В очереди: {queue_count}")
+            else:
+                await callback.answer("Видео уже в очереди")
+
+        # Пропустить добавление в очередь
+        @self.router.callback_query(F.data.startswith("uq_skip:"))
+        async def skip_unique_queue(callback: CallbackQuery):
+            short_file_id = callback.data.split(":", 1)[1]
+            pending_key = f"pending_video_{short_file_id}"
+            video_data = self.user_settings.get(callback.from_user.id, pending_key)
+
+            # Обновляем caption
+            new_caption_parts = []
+            if video_data:
+                if video_data.get("author"):
+                    new_caption_parts.append(f"🎬 {video_data['author']}")
+                if video_data.get("title"):
+                    new_caption_parts.append(video_data["title"][:200])
+            new_caption_parts.append("\n📥 Скачано без водяного знака")
+            new_caption = "\n".join(new_caption_parts)
+
+            try:
+                await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+            except Exception:
+                pass
+
+            await callback.answer("Пропущено")
+
+        # Уникализировать все из очереди
+        @self.router.callback_query(F.data == "uniqueize_all")
+        async def uniqueize_all(callback: CallbackQuery):
+            queue = self.user_settings.get_unique_queue(callback.from_user.id)
+
+            if not queue:
+                await callback.answer("❌ Очередь пуста", show_alert=True)
+                return
+
+            await callback.message.edit_text(
+                f"🚀 Запускаю уникализацию {len(queue)} видео...\n\n"
+                "Видео будут обработаны и отправлены по мере готовности."
+            )
+            await callback.answer()
+
+            # Добавляем все видео из очереди как задачи
+            use_blur = self.user_settings.get_blur_background(callback.from_user.id)
+            added = 0
+
+            for video_data in queue:
+                task = VideoTask(
+                    task_id="",
+                    user_id=callback.from_user.id,
+                    chat_id=callback.message.chat.id,
+                    file_id=video_data.get("file_id"),
+                    video_id=video_data.get("video_id", ""),
+                    author=video_data.get("author", ""),
+                    author_id=video_data.get("author_id", ""),
+                    title=video_data.get("title", ""),
+                    use_blur_background=use_blur,
+                    do_uniqueize=True  # Режим только уникализации
+                )
+
+                if self.queue_manager.add_task(task):
+                    added += 1
+
+            # Очищаем очередь уникализации
+            self.user_settings.clear_unique_queue(callback.from_user.id)
+
+            await callback.message.answer(
+                f"✅ Добавлено {added} видео в обработку!\n\n"
+                "Проверить статус: 📊 Статус очереди",
+                reply_markup=get_main_keyboard()
+            )
+
+        # Очистить очередь уникализации
+        @self.router.callback_query(F.data == "clear_unique_queue")
+        async def clear_unique_queue(callback: CallbackQuery):
+            self.user_settings.clear_unique_queue(callback.from_user.id)
+            await callback.message.edit_text("🗑️ Очередь уникализации очищена")
+            await callback.answer("Очередь очищена")
+
+        # Отправить видео вручную
+        @self.router.callback_query(F.data == "send_video_manual")
+        async def send_video_manual(callback: CallbackQuery, state: FSMContext):
+            await state.set_state(BotStates.waiting_video_for_unique)
+            await callback.message.edit_text(
+                "🔄 **Уникализация видео**\n\n"
+                "Отправьте видео или ссылку на TikTok.\n"
+                "Можно отправить сразу несколько видео!\n\n"
+                "Видео будет обработано и возвращено с изменениями,\n"
+                "невидимыми для глаза, но уникальными для соцсетей.",
+                parse_mode="Markdown"
+            )
+            await callback.answer()
+
         # Главное меню - Помощь
         @self.router.message(F.text == "❓ Помощь")
         async def menu_help(message: Message):
@@ -1209,10 +1596,15 @@ class TikTokBot:
             await message.answer(
                 "❓ **Помощь**\n\n"
                 "**🎬 Парсер TikTok**\n"
-                "Введите запрос → выберите количество → получите уникальные видео!\n\n"
+                "1. Введите запрос → выберите количество\n"
+                "2. Получите видео без водяного знака\n"
+                "3. Под каждым видео кнопка '✅ Уникализировать'\n"
+                "4. Выберите нужные видео\n"
+                "5. Перейдите в 🔄 Уникализация → Уникализировать все\n\n"
                 "**🔄 Уникализация**\n"
-                "Отправьте свои видео или ссылки TikTok.\n"
-                "Бот уникализирует видео:\n"
+                "Обрабатывает выбранные видео из парсера.\n"
+                "Или отправьте свои видео вручную.\n\n"
+                "Уникализация:\n"
                 f"• Наложение 2 из {overlays_count} overlay изображений\n"
                 "• Прозрачность 0.1%-1% (невидимо)\n"
                 "• Случайные метаданные\n"
@@ -1495,7 +1887,7 @@ class TikTokBot:
                 parse_mode="Markdown"
             )
 
-            # Добавляем задачи в очередь
+            # Добавляем задачи в очередь (без уникализации - только скачивание)
             use_blur = self.user_settings.get_blur_background(user_id)
             added = 0
             for video in videos_to_send:
@@ -1508,7 +1900,8 @@ class TikTokBot:
                     author=video.get("author", ""),
                     author_id=video.get("author_id", ""),
                     title=video.get("title", ""),
-                    use_blur_background=use_blur
+                    use_blur_background=use_blur,
+                    skip_uniqueization=True  # Только скачивание, уникализация по выбору
                 )
 
                 if self.queue_manager.add_task(task):
@@ -1520,8 +1913,9 @@ class TikTokBot:
                 f"🔍 Запрос: {query}\n"
                 f"📦 Добавлено в очередь: {added} видео\n"
                 f"💾 В кэше: {cache_stats['user']} ваших видео\n\n"
-                f"Видео будут обработаны и отправлены по мере готовности.\n"
-                f"Проверить статус: 📊 Статус очереди",
+                f"Видео будут скачаны и отправлены.\n"
+                f"Под каждым видео будет кнопка для добавления в уникализацию.\n"
+                f"Потом перейдите в 🔄 Уникализация и нажмите 'Уникализировать все'",
                 parse_mode="Markdown"
             )
 
