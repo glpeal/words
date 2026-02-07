@@ -31,7 +31,7 @@ import shutil
 import logging
 from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -131,6 +131,12 @@ class Config:
     # Файл для сохранения кэша видео
     CACHE_FILE: str = str(SCRIPT_DIR / "video_cache.json")
 
+    # Папка с overlay изображениями для уникализации
+    OVERLAYS_DIR: str = str(SCRIPT_DIR / "overlays")
+
+    # Использовать размытый фон по умолчанию
+    USE_BLUR_BACKGROUND: bool = False
+
 
 # Настройка логирования
 logging.basicConfig(
@@ -151,6 +157,7 @@ class BotStates(StatesGroup):
     waiting_count = State()
     processing = State()
     waiting_video_for_unique = State()
+    settings = State()
 
 
 # ============================================
@@ -170,6 +177,7 @@ class VideoTask:
     author: str = ""
     author_id: str = ""
     title: str = ""
+    use_blur_background: bool = False  # Использовать размытый фон
     status: str = "pending"  # pending, downloading, processing, sending, done, error
     error_message: str = ""
     created_at: datetime = field(default_factory=datetime.now)
@@ -177,6 +185,59 @@ class VideoTask:
     def __post_init__(self):
         if not self.task_id:
             self.task_id = str(uuid.uuid4())[:8]
+
+
+# ============================================
+# USER SETTINGS
+# ============================================
+
+class UserSettings:
+    """Хранение настроек пользователей"""
+
+    def __init__(self, settings_file: str = None):
+        self.settings_file = Path(settings_file) if settings_file else Path(SCRIPT_DIR / "user_settings.json")
+        self._settings: Dict[int, Dict[str, Any]] = {}
+        self._load()
+
+    def _load(self):
+        """Загрузить настройки"""
+        try:
+            if self.settings_file.exists():
+                import json
+                with open(self.settings_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                self._settings = {int(k): v for k, v in data.items()}
+                logger.info(f"Loaded settings for {len(self._settings)} users")
+        except Exception as e:
+            logger.warning(f"Failed to load user settings: {e}")
+
+    def _save(self):
+        """Сохранить настройки"""
+        try:
+            import json
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(self._settings, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save user settings: {e}")
+
+    def get(self, user_id: int, key: str, default: Any = None) -> Any:
+        """Получить настройку пользователя"""
+        return self._settings.get(user_id, {}).get(key, default)
+
+    def set(self, user_id: int, key: str, value: Any):
+        """Установить настройку пользователя"""
+        if user_id not in self._settings:
+            self._settings[user_id] = {}
+        self._settings[user_id][key] = value
+        self._save()
+
+    def get_blur_background(self, user_id: int) -> bool:
+        """Получить настройку размытого фона"""
+        return self.get(user_id, "blur_background", Config.USE_BLUR_BACKGROUND)
+
+    def set_blur_background(self, user_id: int, value: bool):
+        """Установить настройку размытого фона"""
+        self.set(user_id, "blur_background", value)
 
 
 @dataclass
@@ -311,45 +372,118 @@ class VideoUniqueizer:
     """
     Уникализация видео через FFmpeg
 
-    Применяет множество невидимых изменений:
-    - Невидимый шум
-    - Микро-изменение скорости
-    - Сдвиг цветов
-    - Изменение метаданных
-    - Случайный битрейт
-    - Невидимый водяной знак
+    Новый принцип:
+    - Наложение 2 случайных overlay изображений с прозрачностью 0.1%-1%
+    - Опционально: размытый фон + смещение видео на 10-40px
+    - Каждый раз разные метаданные
     """
 
-    def __init__(self, temp_dir: str, ffmpeg_path: str = "ffmpeg"):
+    def __init__(self, temp_dir: str, ffmpeg_path: str = "ffmpeg", overlays_dir: str = None):
         self.temp_dir = Path(temp_dir)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.ffmpeg_path = ffmpeg_path
+        self.overlays_dir = Path(overlays_dir) if overlays_dir else Path(Config.OVERLAYS_DIR)
+        self.overlays_dir.mkdir(parents=True, exist_ok=True)
         self._semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_FFMPEG)
+        self._overlay_images: List[Path] = []
+        self._load_overlays()
 
-    async def uniqueize(self, input_path: str, output_path: Optional[str] = None) -> Optional[str]:
+    def _load_overlays(self):
+        """Загрузить список overlay изображений"""
+        image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
+        self._overlay_images = [
+            f for f in self.overlays_dir.iterdir()
+            if f.is_file() and f.suffix.lower() in image_extensions
+        ]
+        logger.info(f"Loaded {len(self._overlay_images)} overlay images from {self.overlays_dir}")
+
+        if len(self._overlay_images) < 2:
+            logger.warning(
+                f"Need at least 2 overlay images in {self.overlays_dir}. "
+                f"Currently have {len(self._overlay_images)}. "
+                f"Overlay feature will be disabled."
+            )
+
+    def _get_random_overlays(self, count: int = 2) -> List[Path]:
+        """Получить случайные overlay изображения"""
+        if len(self._overlay_images) < count:
+            return []
+        return random.sample(self._overlay_images, count)
+
+    def _generate_random_metadata(self) -> Dict[str, str]:
+        """Генерация случайных метаданных"""
+        # Список случайных слов для генерации уникальных метаданных
+        words = ["video", "clip", "media", "content", "file", "record", "capture",
+                 "moment", "scene", "footage", "reel", "take", "shot", "cut"]
+        adjectives = ["amazing", "cool", "great", "best", "top", "new", "fresh",
+                      "awesome", "super", "mega", "ultra", "pro", "prime", "elite"]
+
+        # Случайные даты в прошлом
+        days_ago = random.randint(1, 365)
+        random_date = datetime.now() - timedelta(days=days_ago)
+
+        return {
+            "title": f"{random.choice(adjectives)}_{random.choice(words)}_{uuid.uuid4().hex[:6]}",
+            "comment": f"{uuid.uuid4()}",
+            "author": f"user_{random.randint(10000, 99999)}",
+            "album": f"collection_{random.randint(1, 999)}",
+            "year": str(random.randint(2020, 2024)),
+            "creation_time": random_date.isoformat(),
+            "encoder": random.choice(["Lavf58", "Lavf59", "Lavf60", "HandBrake", "x264"]),
+            "description": f"{uuid.uuid4().hex}",
+        }
+
+    async def uniqueize(
+        self,
+        input_path: str,
+        output_path: Optional[str] = None,
+        use_blur_background: bool = None
+    ) -> Optional[str]:
         """
         Уникализировать видео
 
         Args:
             input_path: Путь к исходному видео
             output_path: Путь для сохранения (если None - генерируется)
+            use_blur_background: Использовать размытый фон (None = из Config)
 
         Returns:
             Путь к уникализированному видео или None при ошибке
         """
         async with self._semaphore:
-            return await self._process_video(input_path, output_path)
+            return await self._process_video(input_path, output_path, use_blur_background)
 
-    async def _process_video(self, input_path: str, output_path: Optional[str] = None) -> Optional[str]:
+    async def _process_video(
+        self,
+        input_path: str,
+        output_path: Optional[str] = None,
+        use_blur_background: bool = None
+    ) -> Optional[str]:
         """Внутренняя обработка видео"""
         if not output_path:
             output_path = str(self.temp_dir / f"unique_{uuid.uuid4().hex[:8]}.mp4")
 
-        # Генерируем случайные параметры для уникализации
-        params = self._generate_random_params()
+        if use_blur_background is None:
+            use_blur_background = Config.USE_BLUR_BACKGROUND
+
+        # Получаем overlay изображения
+        overlays = self._get_random_overlays(2)
+
+        # Генерируем параметры
+        metadata = self._generate_random_metadata()
+        overlay_opacity = [random.uniform(0.001, 0.01) for _ in range(2)]  # 0.1% - 1%
+        video_offset = random.randint(10, 40) if use_blur_background else 0
 
         # Формируем FFmpeg команду
-        cmd = self._build_ffmpeg_command(input_path, output_path, params)
+        cmd = self._build_ffmpeg_command(
+            input_path=input_path,
+            output_path=output_path,
+            overlays=overlays,
+            overlay_opacity=overlay_opacity,
+            metadata=metadata,
+            use_blur_background=use_blur_background,
+            video_offset=video_offset
+        )
 
         logger.debug(f"FFmpeg command: {' '.join(cmd)}")
 
@@ -382,124 +516,109 @@ class VideoUniqueizer:
             logger.error(f"FFmpeg exception: {e}")
             return None
 
-    def _generate_random_params(self) -> Dict[str, Any]:
-        """Генерация случайных параметров уникализации"""
-        return {
-            # Скорость видео (почти незаметное изменение)
-            "speed": random.uniform(0.98, 1.02),
-
-            # Шум (очень слабый, невидимый)
-            "noise_strength": random.uniform(0.5, 2.0),
-
-            # Сдвиг яркости
-            "brightness": random.uniform(-0.02, 0.02),
-
-            # Сдвиг контраста
-            "contrast": random.uniform(0.98, 1.02),
-
-            # Сдвиг насыщенности
-            "saturation": random.uniform(0.98, 1.02),
-
-            # Гамма
-            "gamma": random.uniform(0.98, 1.02),
-
-            # Сдвиг оттенка (в градусах)
-            "hue_shift": random.uniform(-2, 2),
-
-            # Битрейт видео
-            "video_bitrate": random.choice(["2M", "2.5M", "3M", "3.5M", "4M"]),
-
-            # Битрейт аудио
-            "audio_bitrate": random.choice(["128k", "160k", "192k"]),
-
-            # Изменение громкости
-            "volume": random.uniform(0.95, 1.05),
-
-            # Случайные метаданные
-            "metadata_title": f"video_{uuid.uuid4().hex[:6]}",
-            "metadata_comment": str(uuid.uuid4()),
-
-            # Небольшой crop (1-2 пикселя с каждой стороны)
-            "crop_pixels": random.randint(1, 3),
-
-            # Поворот на микро-угол
-            "rotation": random.uniform(-0.5, 0.5),
-        }
-
-    def _build_ffmpeg_command(self, input_path: str, output_path: str, params: Dict[str, Any]) -> List[str]:
+    def _build_ffmpeg_command(
+        self,
+        input_path: str,
+        output_path: str,
+        overlays: List[Path],
+        overlay_opacity: List[float],
+        metadata: Dict[str, str],
+        use_blur_background: bool,
+        video_offset: int
+    ) -> List[str]:
         """Построение FFmpeg команды"""
 
-        # Видеофильтры
-        video_filters = [
-            # Небольшой crop для изменения разрешения
-            f"crop=iw-{params['crop_pixels']*2}:ih-{params['crop_pixels']*2}:{params['crop_pixels']}:{params['crop_pixels']}",
+        cmd = [self.ffmpeg_path, "-y"]
 
-            # Масштабирование обратно (pad вместо scale для сохранения качества)
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        # Входной файл (видео)
+        cmd.extend(["-i", input_path])
 
-            # Коррекция цвета
-            f"eq=brightness={params['brightness']}:contrast={params['contrast']}:saturation={params['saturation']}:gamma={params['gamma']}",
+        # Добавляем overlay изображения
+        for overlay in overlays:
+            cmd.extend(["-i", str(overlay)])
 
-            # Сдвиг оттенка
-            f"hue=h={params['hue_shift']}",
+        # Строим filter_complex
+        filter_parts = []
 
-            # Добавление шума (очень слабого)
-            f"noise=alls={params['noise_strength']}:allf=t",
+        if use_blur_background:
+            # Размытый фон: масштабируем видео, размываем, накладываем оригинал со смещением
+            # [0:v] - исходное видео
+            # Создаем размытый фон
+            filter_parts.append(
+                f"[0:v]scale=iw+{video_offset*2}:ih+{video_offset*2},boxblur=20:5[bg]"
+            )
+            # Накладываем оригинал со смещением
+            filter_parts.append(
+                f"[bg][0:v]overlay={video_offset}:{video_offset}[base]"
+            )
+            base_label = "[base]"
+        else:
+            # Без размытого фона - просто копируем
+            filter_parts.append("[0:v]null[base]")
+            base_label = "[base]"
 
-            # Изменение скорости
-            f"setpts={1/params['speed']}*PTS",
+        # Накладываем overlay изображения
+        current_label = base_label
+        for i, (overlay, opacity) in enumerate(zip(overlays, overlay_opacity)):
+            next_label = f"[v{i}]"
+            # Масштабируем overlay под размер видео и применяем прозрачность
+            filter_parts.append(
+                f"[{i+1}:v]scale=iw:ih,format=rgba,"
+                f"colorchannelmixer=aa={opacity:.4f}[ovr{i}]"
+            )
+            # Накладываем
+            filter_parts.append(
+                f"{current_label}[ovr{i}]overlay=0:0:format=auto{next_label}"
+            )
+            current_label = next_label
 
-            # Микро-поворот
-            f"rotate={params['rotation']}*PI/180",
-        ]
+        # Финальное масштабирование для корректного размера
+        final_label = current_label.strip("[]")
+        filter_parts.append(f"[{final_label}]scale=trunc(iw/2)*2:trunc(ih/2)*2[out]")
 
-        # Аудиофильтры
-        audio_filters = [
-            # Изменение скорости аудио (синхронно с видео)
-            f"atempo={params['speed']}",
+        # Если нет overlay - упрощенный фильтр
+        if not overlays:
+            if use_blur_background:
+                filter_complex = (
+                    f"[0:v]scale=iw+{video_offset*2}:ih+{video_offset*2},"
+                    f"boxblur=20:5[bg];"
+                    f"[bg][0:v]overlay={video_offset}:{video_offset},"
+                    f"scale=trunc(iw/2)*2:trunc(ih/2)*2[out]"
+                )
+            else:
+                filter_complex = "[0:v]scale=trunc(iw/2)*2:trunc(ih/2)*2[out]"
+        else:
+            filter_complex = ";".join(filter_parts)
 
-            # Изменение громкости
-            f"volume={params['volume']}",
+        cmd.extend(["-filter_complex", filter_complex])
+        cmd.extend(["-map", "[out]", "-map", "0:a?"])
 
-            # Небольшой сдвиг высоты тона (почти незаметный)
-            f"asetrate=44100*{random.uniform(0.99, 1.01)},aresample=44100",
-        ]
-
-        cmd = [
-            self.ffmpeg_path,
-            "-y",  # Перезаписывать файлы
-            "-i", input_path,
-
-            # Видеофильтры
-            "-vf", ",".join(video_filters),
-
-            # Аудиофильтры
-            "-af", ",".join(audio_filters),
-
-            # Видеокодек
+        # Видеокодек
+        cmd.extend([
             "-c:v", "libx264",
-            "-preset", "fast",  # Быстрее, меньше нагрузка
-            "-crf", "23",  # Качество
-            "-b:v", params["video_bitrate"],
+            "-preset", "fast",
+            "-crf", "23",
+            "-b:v", random.choice(["2M", "2.5M", "3M", "3.5M", "4M"]),
+        ])
 
-            # Аудиокодек
+        # Аудиокодек
+        cmd.extend([
             "-c:a", "aac",
-            "-b:a", params["audio_bitrate"],
+            "-b:a", random.choice(["128k", "160k", "192k"]),
+        ])
 
-            # Метаданные (очистка старых + новые случайные)
-            "-map_metadata", "-1",
-            "-metadata", f"title={params['metadata_title']}",
-            "-metadata", f"comment={params['metadata_comment']}",
-            "-metadata", f"creation_time={datetime.now().isoformat()}",
+        # Метаданные (очистка старых + новые случайные)
+        cmd.extend(["-map_metadata", "-1"])
+        for key, value in metadata.items():
+            cmd.extend(["-metadata", f"{key}={value}"])
 
-            # Оптимизация для веба
-            "-movflags", "+faststart",
+        # Оптимизация для веба
+        cmd.extend(["-movflags", "+faststart"])
 
-            # Ограничение потоков для снижения нагрузки
-            "-threads", "2",
+        # Ограничение потоков для снижения нагрузки
+        cmd.extend(["-threads", "2"])
 
-            output_path
-        ]
+        cmd.append(output_path)
 
         return cmd
 
@@ -766,7 +885,10 @@ class QueueManager:
 
             # Шаг 2: Уникализация
             task.status = "processing"
-            unique_path = await self.uniqueizer.uniqueize(downloaded_path)
+            unique_path = await self.uniqueizer.uniqueize(
+                downloaded_path,
+                use_blur_background=task.use_blur_background
+            )
 
             if not unique_path:
                 task.status = "error"
@@ -886,6 +1008,9 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
     )
     builder.row(
         KeyboardButton(text="📊 Статус очереди"),
+        KeyboardButton(text="⚙️ Настройки")
+    )
+    builder.row(
         KeyboardButton(text="❓ Помощь")
     )
     return builder.as_markup(resize_keyboard=True)
@@ -929,6 +1054,7 @@ class TikTokBot:
         self.downloader = TikTokDownloader(Config.TEMP_DIR)
         self.uniqueizer = VideoUniqueizer(Config.TEMP_DIR, ffmpeg_path)
         self.video_cache = VideoCache(Config.CACHE_FILE)
+        self.user_settings = UserSettings()
         self.queue_manager = QueueManager(
             self.bot, self.downloader, self.uniqueizer,
             storage_chat_id, self.video_cache
@@ -1008,20 +1134,91 @@ class TikTokBot:
             # Очищаем завершенные
             self.queue_manager.clear_completed(message.from_user.id)
 
+        # Главное меню - Настройки
+        @self.router.message(F.text == "⚙️ Настройки")
+        async def menu_settings(message: Message):
+            blur_enabled = self.user_settings.get_blur_background(message.from_user.id)
+            blur_status = "✅ Включен" if blur_enabled else "❌ Выключен"
+
+            builder = InlineKeyboardBuilder()
+            builder.button(
+                text=f"{'🔵' if blur_enabled else '⚪'} Размытый фон: {blur_status}",
+                callback_data="toggle_blur"
+            )
+            builder.button(text="◀️ Назад", callback_data="back_to_menu")
+            builder.adjust(1)
+
+            overlays_count = len(self.uniqueizer._overlay_images)
+
+            await message.answer(
+                "⚙️ **Настройки**\n\n"
+                f"**Размытый фон:** {blur_status}\n"
+                "При включении видео будет со смещением на размытом фоне\n\n"
+                f"**Overlay изображений:** {overlays_count} шт.\n"
+                f"Папка: `{Config.OVERLAYS_DIR}`\n\n"
+                "Положите 2-10 изображений в папку overlays для уникализации.",
+                reply_markup=builder.as_markup(),
+                parse_mode="Markdown"
+            )
+
+        # Переключение размытого фона
+        @self.router.callback_query(F.data == "toggle_blur")
+        async def toggle_blur(callback: CallbackQuery):
+            current = self.user_settings.get_blur_background(callback.from_user.id)
+            new_value = not current
+            self.user_settings.set_blur_background(callback.from_user.id, new_value)
+
+            blur_status = "✅ Включен" if new_value else "❌ Выключен"
+
+            builder = InlineKeyboardBuilder()
+            builder.button(
+                text=f"{'🔵' if new_value else '⚪'} Размытый фон: {blur_status}",
+                callback_data="toggle_blur"
+            )
+            builder.button(text="◀️ Назад", callback_data="back_to_menu")
+            builder.adjust(1)
+
+            overlays_count = len(self.uniqueizer._overlay_images)
+
+            await callback.message.edit_text(
+                "⚙️ **Настройки**\n\n"
+                f"**Размытый фон:** {blur_status}\n"
+                "При включении видео будет со смещением на размытом фоне\n\n"
+                f"**Overlay изображений:** {overlays_count} шт.\n"
+                f"Папка: `{Config.OVERLAYS_DIR}`\n\n"
+                "Положите 2-10 изображений в папку overlays для уникализации.",
+                reply_markup=builder.as_markup(),
+                parse_mode="Markdown"
+            )
+            await callback.answer(f"Размытый фон {'включен' if new_value else 'выключен'}")
+
+        # Назад в меню
+        @self.router.callback_query(F.data == "back_to_menu")
+        async def back_to_menu(callback: CallbackQuery):
+            await callback.message.delete()
+            await callback.message.answer(
+                "Выберите действие:",
+                reply_markup=get_main_keyboard()
+            )
+            await callback.answer()
+
         # Главное меню - Помощь
         @self.router.message(F.text == "❓ Помощь")
         async def menu_help(message: Message):
+            overlays_count = len(self.uniqueizer._overlay_images)
             await message.answer(
                 "❓ **Помощь**\n\n"
                 "**🎬 Парсер TikTok**\n"
                 "Введите запрос → выберите количество → получите уникальные видео!\n\n"
                 "**🔄 Уникализация**\n"
                 "Отправьте свои видео или ссылки TikTok.\n"
-                "Бот обработает их через FFmpeg:\n"
-                "• Невидимый шум\n"
-                "• Изменение метаданных\n"
-                "• Микро-коррекция цвета\n"
-                "• Изменение битрейта\n\n"
+                "Бот уникализирует видео:\n"
+                f"• Наложение 2 из {overlays_count} overlay изображений\n"
+                "• Прозрачность 0.1%-1% (невидимо)\n"
+                "• Случайные метаданные\n"
+                "• Опционально: размытый фон\n\n"
+                "**⚙️ Настройки**\n"
+                "Включите размытый фон для дополнительной уникализации.\n\n"
                 "**📊 Очередь**\n"
                 "Видео обрабатываются по очереди.\n"
                 f"Максимум {Config.MAX_QUEUE_PER_USER} видео в очереди.\n\n"
@@ -1116,13 +1313,15 @@ class TikTokBot:
         # Обработка видео для уникализации
         @self.router.message(BotStates.waiting_video_for_unique, F.video)
         async def handle_video_for_unique(message: Message):
+            use_blur = self.user_settings.get_blur_background(message.from_user.id)
             task = VideoTask(
                 task_id="",
                 user_id=message.from_user.id,
                 chat_id=message.chat.id,
                 file_id=message.video.file_id,
                 author="",
-                title="Ваше видео"
+                title="Ваше видео",
+                use_blur_background=use_blur
             )
 
             if self.queue_manager.add_task(task):
@@ -1155,6 +1354,7 @@ class TikTokBot:
                 await status_msg.edit_text("❌ Не удалось получить видео по ссылке")
                 return
 
+            use_blur = self.user_settings.get_blur_background(message.from_user.id)
             task = VideoTask(
                 task_id="",
                 user_id=message.from_user.id,
@@ -1162,7 +1362,8 @@ class TikTokBot:
                 video_url=info["video_url"],
                 author=info.get("author", ""),
                 author_id=info.get("author_id", ""),
-                title=info.get("title", "")
+                title=info.get("title", ""),
+                use_blur_background=use_blur
             )
 
             if self.queue_manager.add_task(task):
@@ -1225,6 +1426,7 @@ class TikTokBot:
                 await callback.message.edit_text("❌ Не удалось получить видео")
                 return
 
+            use_blur = self.user_settings.get_blur_background(callback.from_user.id)
             task = VideoTask(
                 task_id="",
                 user_id=callback.from_user.id,
@@ -1232,7 +1434,8 @@ class TikTokBot:
                 video_url=info["video_url"],
                 author=info.get("author", ""),
                 author_id=info.get("author_id", ""),
-                title=info.get("title", "")
+                title=info.get("title", ""),
+                use_blur_background=use_blur
             )
 
             if self.queue_manager.add_task(task):
@@ -1293,6 +1496,7 @@ class TikTokBot:
             )
 
             # Добавляем задачи в очередь
+            use_blur = self.user_settings.get_blur_background(user_id)
             added = 0
             for video in videos_to_send:
                 task = VideoTask(
@@ -1303,7 +1507,8 @@ class TikTokBot:
                     video_id=video.get("video_id", ""),
                     author=video.get("author", ""),
                     author_id=video.get("author_id", ""),
-                    title=video.get("title", "")
+                    title=video.get("title", ""),
+                    use_blur_background=use_blur
                 )
 
                 if self.queue_manager.add_task(task):
