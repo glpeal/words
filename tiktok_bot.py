@@ -185,6 +185,7 @@ class VideoTask:
     author_id: str = ""
     title: str = ""
     use_blur_background: bool = False  # Использовать размытый фон
+    use_snow_effect: bool = False  # Добавить плавающую точку (снег)
     skip_uniqueization: bool = False  # Пропустить уникализацию (только скачать)
     do_uniqueize: bool = False  # Выполнить только уникализацию (из очереди)
     status: str = "pending"  # pending, downloading, processing, sending, done, error
@@ -297,6 +298,14 @@ class UserSettings:
     def clear_year_filter(self, user_id: int):
         """Сбросить фильтр по году"""
         self.set(user_id, "year_filter", {"mode": "off", "year": None})
+
+    def get_snow_effect(self, user_id: int) -> bool:
+        """Получить настройку эффекта снега (плавающая точка)"""
+        return self.get(user_id, "snow_effect", False)
+
+    def set_snow_effect(self, user_id: int, value: bool):
+        """Установить настройку эффекта снега"""
+        self.set(user_id, "snow_effect", value)
 
 
 @dataclass
@@ -546,7 +555,8 @@ class VideoUniqueizer:
         self,
         input_path: str,
         output_path: Optional[str] = None,
-        use_blur_background: bool = None
+        use_blur_background: bool = None,
+        use_snow_effect: bool = False
     ) -> Optional[str]:
         """
         Уникализировать видео
@@ -555,18 +565,20 @@ class VideoUniqueizer:
             input_path: Путь к исходному видео
             output_path: Путь для сохранения (если None - генерируется)
             use_blur_background: Использовать размытый фон (None = из Config)
+            use_snow_effect: Добавить эффект снега (плавающая точка)
 
         Returns:
             Путь к уникализированному видео или None при ошибке
         """
         async with self._semaphore:
-            return await self._process_video(input_path, output_path, use_blur_background)
+            return await self._process_video(input_path, output_path, use_blur_background, use_snow_effect)
 
     async def _process_video(
         self,
         input_path: str,
         output_path: Optional[str] = None,
-        use_blur_background: bool = None
+        use_blur_background: bool = None,
+        use_snow_effect: bool = False
     ) -> Optional[str]:
         """Внутренняя обработка видео"""
         if not output_path:
@@ -591,7 +603,8 @@ class VideoUniqueizer:
             overlay_opacity=overlay_opacity,
             metadata=metadata,
             use_blur_background=use_blur_background,
-            video_offset=video_offset
+            video_offset=video_offset,
+            use_snow_effect=use_snow_effect
         )
 
         logger.debug(f"FFmpeg command: {' '.join(cmd)}")
@@ -633,7 +646,8 @@ class VideoUniqueizer:
         overlay_opacity: List[float],
         metadata: Dict[str, str],
         use_blur_background: bool,
-        video_offset: int
+        video_offset: int,
+        use_snow_effect: bool = False
     ) -> List[str]:
         """Построение FFmpeg команды"""
 
@@ -681,21 +695,58 @@ class VideoUniqueizer:
             )
             current_label = next_label
 
+        # Добавляем эффект снега (плавающая точка)
+        if use_snow_effect:
+            snow_label = current_label.strip("[]")
+            # Случайные параметры для уникального движения
+            speed_x = random.uniform(0.3, 0.7)  # Скорость по X
+            speed_y = random.uniform(0.2, 0.5)  # Скорость по Y
+            phase_x = random.uniform(0, 6.28)   # Начальная фаза X (0-2π)
+            phase_y = random.uniform(0, 6.28)   # Начальная фаза Y
+            # Маленькая точка движущаяся плавно по синусоиде
+            # Размер точки 2-4 пикселя, прозрачность 10%
+            dot_size = random.randint(2, 4)
+            # drawbox с движением: x и y вычисляются через sin/cos от времени
+            # Точка двигается от центра с амплитудой W/3 и H/3
+            filter_parts.append(
+                f"[{snow_label}]drawbox="
+                f"x='W/2+W/3*sin({speed_x}*t+{phase_x:.2f})-{dot_size/2}':"
+                f"y='H/2+H/3*cos({speed_y}*t+{phase_y:.2f})-{dot_size/2}':"
+                f"w={dot_size}:h={dot_size}:"
+                f"color=white@0.1:t=fill[snow]"
+            )
+            current_label = "[snow]"
+
         # Финальное масштабирование для корректного размера
         final_label = current_label.strip("[]")
         filter_parts.append(f"[{final_label}]scale=trunc(iw/2)*2:trunc(ih/2)*2[out]")
 
         # Если нет overlay - упрощенный фильтр
         if not overlays:
+            snow_filter = ""
+            if use_snow_effect:
+                speed_x = random.uniform(0.3, 0.7)
+                speed_y = random.uniform(0.2, 0.5)
+                phase_x = random.uniform(0, 6.28)
+                phase_y = random.uniform(0, 6.28)
+                dot_size = random.randint(2, 4)
+                snow_filter = (
+                    f",drawbox="
+                    f"x='W/2+W/3*sin({speed_x}*t+{phase_x:.2f})-{dot_size/2}':"
+                    f"y='H/2+H/3*cos({speed_y}*t+{phase_y:.2f})-{dot_size/2}':"
+                    f"w={dot_size}:h={dot_size}:"
+                    f"color=white@0.1:t=fill"
+                )
+
             if use_blur_background:
                 filter_complex = (
                     f"[0:v]scale=iw+{video_offset*2}:ih+{video_offset*2},"
                     f"boxblur=20:5[bg];"
-                    f"[bg][0:v]overlay={video_offset}:{video_offset},"
+                    f"[bg][0:v]overlay={video_offset}:{video_offset}{snow_filter},"
                     f"scale=trunc(iw/2)*2:trunc(ih/2)*2[out]"
                 )
             else:
-                filter_complex = "[0:v]scale=trunc(iw/2)*2:trunc(ih/2)*2[out]"
+                filter_complex = f"[0:v]scale=trunc(iw/2)*2:trunc(ih/2)*2{snow_filter}[out]"
         else:
             filter_complex = ";".join(filter_parts)
 
@@ -1067,7 +1118,8 @@ class QueueManager:
             task.status = "processing"
             unique_path = await self.uniqueizer.uniqueize(
                 downloaded_path,
-                use_blur_background=task.use_blur_background
+                use_blur_background=task.use_blur_background,
+                use_snow_effect=task.use_snow_effect
             )
 
             if not unique_path:
@@ -1286,7 +1338,8 @@ class QueueManager:
             task.status = "processing"
             unique_path = await self.uniqueizer.uniqueize(
                 downloaded_path,
-                use_blur_background=task.use_blur_background
+                use_blur_background=task.use_blur_background,
+                use_snow_effect=task.use_snow_effect
             )
 
             if not unique_path:
@@ -1557,6 +1610,9 @@ class TikTokBot:
             blur_enabled = self.user_settings.get_blur_background(user_id)
             blur_status = "✅ Вкл" if blur_enabled else "❌ Выкл"
 
+            snow_enabled = self.user_settings.get_snow_effect(user_id)
+            snow_status = "✅ Вкл" if snow_enabled else "❌ Выкл"
+
             year_filter = self.user_settings.get_year_filter(user_id)
             year_mode = year_filter.get("mode", "off")
             year_value = year_filter.get("year")
@@ -1576,6 +1632,10 @@ class TikTokBot:
                 callback_data="toggle_blur"
             )
             builder.button(
+                text=f"{'❄️' if snow_enabled else '⚪'} Снег (точка): {snow_status}",
+                callback_data="toggle_snow"
+            )
+            builder.button(
                 text=f"📅 Фильтр по году: {year_status}",
                 callback_data="year_filter_menu"
             )
@@ -1588,6 +1648,8 @@ class TikTokBot:
                 "⚙️ **Настройки**\n\n"
                 f"**Размытый фон:** {blur_status}\n"
                 "При включении видео будет со смещением на размытом фоне\n\n"
+                f"**Снег (точка):** {snow_status}\n"
+                "Маленькая точка плавно двигается по видео (10% прозрачности)\n\n"
                 f"**Фильтр по году:** {year_status}\n"
                 "Фильтрация видео по году публикации\n\n"
                 f"**Overlay изображений:** {overlays_count} шт.\n"
@@ -1613,6 +1675,17 @@ class TikTokBot:
             text, keyboard = _get_settings_text_and_keyboard(callback.from_user.id)
             await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
             await callback.answer(f"Размытый фон {'включен' if new_value else 'выключен'}")
+
+        # Переключение эффекта снега
+        @self.router.callback_query(F.data == "toggle_snow")
+        async def toggle_snow(callback: CallbackQuery):
+            current = self.user_settings.get_snow_effect(callback.from_user.id)
+            new_value = not current
+            self.user_settings.set_snow_effect(callback.from_user.id, new_value)
+
+            text, keyboard = _get_settings_text_and_keyboard(callback.from_user.id)
+            await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+            await callback.answer(f"Эффект снега {'включен' if new_value else 'выключен'}")
 
         # Меню фильтра по году
         @self.router.callback_query(F.data == "year_filter_menu")
@@ -1806,6 +1879,7 @@ class TikTokBot:
 
             # Добавляем все видео из очереди как задачи
             use_blur = self.user_settings.get_blur_background(callback.from_user.id)
+            use_snow = self.user_settings.get_snow_effect(callback.from_user.id)
             added = 0
 
             for video_data in queue:
@@ -1819,6 +1893,7 @@ class TikTokBot:
                     author_id=video_data.get("author_id", ""),
                     title=video_data.get("title", ""),
                     use_blur_background=use_blur,
+                    use_snow_effect=use_snow,
                     do_uniqueize=True  # Режим только уникализации
                 )
 
@@ -1972,6 +2047,7 @@ class TikTokBot:
         @self.router.message(BotStates.waiting_video_for_unique, F.video)
         async def handle_video_for_unique(message: Message):
             use_blur = self.user_settings.get_blur_background(message.from_user.id)
+            use_snow = self.user_settings.get_snow_effect(message.from_user.id)
             task = VideoTask(
                 task_id="",
                 user_id=message.from_user.id,
@@ -1979,7 +2055,8 @@ class TikTokBot:
                 file_id=message.video.file_id,
                 author="",
                 title="Ваше видео",
-                use_blur_background=use_blur
+                use_blur_background=use_blur,
+                use_snow_effect=use_snow
             )
 
             if self.queue_manager.add_task(task):
@@ -2013,6 +2090,7 @@ class TikTokBot:
                 return
 
             use_blur = self.user_settings.get_blur_background(message.from_user.id)
+            use_snow = self.user_settings.get_snow_effect(message.from_user.id)
             task = VideoTask(
                 task_id="",
                 user_id=message.from_user.id,
@@ -2021,7 +2099,8 @@ class TikTokBot:
                 author=info.get("author", ""),
                 author_id=info.get("author_id", ""),
                 title=info.get("title", ""),
-                use_blur_background=use_blur
+                use_blur_background=use_blur,
+                use_snow_effect=use_snow
             )
 
             if self.queue_manager.add_task(task):
@@ -2085,6 +2164,7 @@ class TikTokBot:
                 return
 
             use_blur = self.user_settings.get_blur_background(callback.from_user.id)
+            use_snow = self.user_settings.get_snow_effect(callback.from_user.id)
             task = VideoTask(
                 task_id="",
                 user_id=callback.from_user.id,
@@ -2093,7 +2173,8 @@ class TikTokBot:
                 author=info.get("author", ""),
                 author_id=info.get("author_id", ""),
                 title=info.get("title", ""),
-                use_blur_background=use_blur
+                use_blur_background=use_blur,
+                use_snow_effect=use_snow
             )
 
             if self.queue_manager.add_task(task):
@@ -2189,6 +2270,7 @@ class TikTokBot:
 
             # Добавляем задачи в очередь (без уникализации - только скачивание)
             use_blur = self.user_settings.get_blur_background(user_id)
+            use_snow = self.user_settings.get_snow_effect(user_id)
             added = 0
             for video in videos_to_send:
                 task = VideoTask(
@@ -2201,6 +2283,7 @@ class TikTokBot:
                     author_id=video.get("author_id", ""),
                     title=video.get("title", ""),
                     use_blur_background=use_blur,
+                    use_snow_effect=use_snow,
                     skip_uniqueization=True  # Только скачивание, уникализация по выбору
                 )
 
