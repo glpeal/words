@@ -1007,6 +1007,51 @@ class QueueManager:
 
         return None
 
+    async def _send_video_with_retry(
+        self,
+        chat_id: int,
+        video: Any,
+        caption: str = None,
+        reply_markup: Any = None,
+        supports_streaming: bool = True,
+        disable_notification: bool = False
+    ) -> Optional[Message]:
+        """
+        Отправить видео с обработкой flood control.
+        Для спаршенных видео (без уникализации).
+        """
+        # Соблюдаем минимальную задержку между отправками
+        now = asyncio.get_event_loop().time()
+        elapsed = now - self._last_send_time
+        if elapsed < Config.SEND_DELAY:
+            await asyncio.sleep(Config.SEND_DELAY - elapsed)
+
+        for attempt in range(Config.MAX_RETRY_ATTEMPTS):
+            try:
+                result = await self.bot.send_video(
+                    chat_id=chat_id,
+                    video=video,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                    supports_streaming=supports_streaming,
+                    disable_notification=disable_notification
+                )
+                self._last_send_time = asyncio.get_event_loop().time()
+                return result
+
+            except TelegramRetryAfter as e:
+                wait_time = e.retry_after + 1
+                logger.warning(f"Flood control: waiting {wait_time}s (attempt {attempt + 1}/{Config.MAX_RETRY_ATTEMPTS})")
+                await asyncio.sleep(wait_time)
+
+            except Exception as e:
+                logger.error(f"Error sending video: {e}")
+                if attempt == Config.MAX_RETRY_ATTEMPTS - 1:
+                    raise
+                await asyncio.sleep(2 ** attempt)
+
+        return None
+
     def get_user_queue(self, user_id: int) -> UserQueue:
         """Получить очередь пользователя"""
         if user_id not in self._user_queues:
@@ -1214,7 +1259,7 @@ class QueueManager:
                 await self.uniqueizer.cleanup_file(unique_path)
 
     async def _process_download_only(self, task: VideoTask, downloaded_path: str, video_id: str):
-        """Обработка только скачивания (без уникализации) - для парсера"""
+        """Обработка только скачивания (без уникализации) - для парсера. Видео отправляется как видео."""
         try:
             task.status = "sending"
 
@@ -1228,25 +1273,24 @@ class QueueManager:
                 f"👥 User: {task.user_id}"
             )
 
-            # Для скачанных файлов используем оригинальное имя
-            filename = f"tiktok_{video_id}.mp4"
-            video_file = FSInputFile(downloaded_path, filename=filename)
+            video_file = FSInputFile(downloaded_path)
 
-            # Отправляем в storage группу как файл (с retry при flood control)
-            storage_msg = await self._send_document_with_retry(
+            # Отправляем в storage группу как ВИДЕО (с retry при flood control)
+            storage_msg = await self._send_video_with_retry(
                 chat_id=self.storage_chat_id,
-                document=video_file,
+                video=video_file,
                 caption=storage_caption,
+                supports_streaming=True,
                 disable_notification=True
             )
 
-            if not storage_msg or not storage_msg.document:
+            if not storage_msg or not storage_msg.video:
                 task.status = "error"
                 task.error_message = "Не удалось отправить видео в storage"
                 await self._send_error(task)
                 return
 
-            file_id = storage_msg.document.file_id
+            file_id = storage_msg.video.file_id
 
             # Добавляем в кэш
             self.video_cache.add(
@@ -1271,18 +1315,18 @@ class QueueManager:
             # Инлайн кнопки для добавления в очередь уникализации
             builder = InlineKeyboardBuilder()
             # Сохраняем file_id и метаданные в callback_data (ограничение 64 байта)
-            # Используем короткий формат: uq:file_id[:20]:author_id[:15]
             short_file_id = file_id[:40]  # Урезаем file_id
             builder.button(text="✅ Да, уникализировать", callback_data=f"uq_add:{short_file_id}")
             builder.button(text="❌ Нет", callback_data=f"uq_skip:{short_file_id}")
             builder.adjust(1)
 
-            # Отправляем пользователю как файл с кнопками (с retry при flood control)
-            sent_msg = await self._send_document_with_retry(
+            # Отправляем пользователю как ВИДЕО с кнопками (с retry при flood control)
+            sent_msg = await self._send_video_with_retry(
                 chat_id=task.chat_id,
-                document=file_id,
+                video=file_id,
                 caption=user_caption,
-                reply_markup=builder.as_markup()
+                reply_markup=builder.as_markup(),
+                supports_streaming=True
             )
 
             if not sent_msg:
