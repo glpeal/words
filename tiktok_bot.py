@@ -49,6 +49,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.exceptions import TelegramRetryAfter
 
 # ============================================
 # КОНФИГУРАЦИЯ
@@ -136,6 +137,12 @@ class Config:
 
     # Использовать размытый фон по умолчанию
     USE_BLUR_BACKGROUND: bool = False
+
+    # Задержка между отправкой видео в Telegram (секунды)
+    SEND_DELAY: float = 1.5
+
+    # Максимальное количество попыток отправки при flood control
+    MAX_RETRY_ATTEMPTS: int = 3
 
 
 # Настройка логирования
@@ -272,6 +279,24 @@ class UserSettings:
     def get_unique_queue_count(self, user_id: int) -> int:
         """Получить количество видео в очереди на уникализацию"""
         return len(self.get_unique_queue(user_id))
+
+    def get_year_filter(self, user_id: int) -> Dict[str, Any]:
+        """
+        Получить настройки фильтра по году.
+        Возвращает: {"mode": "off"|"only"|"exclude", "year": int|None}
+        """
+        return self.get(user_id, "year_filter", {"mode": "off", "year": None})
+
+    def set_year_filter(self, user_id: int, mode: str, year: Optional[int] = None):
+        """
+        Установить фильтр по году.
+        mode: "off" - выключен, "only" - только этот год, "exclude" - исключить этот год
+        """
+        self.set(user_id, "year_filter", {"mode": mode, "year": year})
+
+    def clear_year_filter(self, user_id: int):
+        """Сбросить фильтр по году"""
+        self.set(user_id, "year_filter", {"mode": "off", "year": None})
 
 
 @dataclass
@@ -445,26 +470,76 @@ class VideoUniqueizer:
         return random.sample(self._overlay_images, count)
 
     def _generate_random_metadata(self) -> Dict[str, str]:
-        """Генерация случайных метаданных"""
-        # Список случайных слов для генерации уникальных метаданных
-        words = ["video", "clip", "media", "content", "file", "record", "capture",
-                 "moment", "scene", "footage", "reel", "take", "shot", "cut"]
-        adjectives = ["amazing", "cool", "great", "best", "top", "new", "fresh",
-                      "awesome", "super", "mega", "ultra", "pro", "prime", "elite"]
+        """
+        Генерация метаданных как у видеоредакторов CapCut/VN.
+        Эти метаданные делают видео похожим на экспорт из мобильных редакторов.
+        """
+        # Случайная дата создания (последние 30 дней)
+        days_ago = random.randint(0, 30)
+        hours_ago = random.randint(0, 23)
+        random_date = datetime.now() - timedelta(days=days_ago, hours=hours_ago)
+        creation_time = random_date.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
 
-        # Случайные даты в прошлом
-        days_ago = random.randint(1, 365)
-        random_date = datetime.now() - timedelta(days=days_ago)
+        # Варианты редакторов и их метаданных
+        editors = [
+            {
+                # CapCut стиль
+                "encoder": "CapCut",
+                "handler_name": "CapCut Video Handler",
+                "vendor_id": "[0][0][0][0]",
+                "compatible_brands": "isomiso2avc1mp41",
+                "major_brand": "isom",
+                "minor_version": "512",
+                "comment": f"CapCut {random.choice(['3.9.0', '4.0.0', '4.1.0', '4.2.0', '4.3.0'])}",
+            },
+            {
+                # VN Video Editor стиль
+                "encoder": "VN Video Editor",
+                "handler_name": "VN Media Handler",
+                "vendor_id": "[0][0][0][0]",
+                "compatible_brands": "isomiso2avc1mp41",
+                "major_brand": "isom",
+                "minor_version": "512",
+                "comment": f"VN {random.choice(['1.40.8', '1.41.0', '1.42.0', '2.0.0', '2.1.0'])}",
+            },
+            {
+                # InShot стиль
+                "encoder": "InShot Video Editor",
+                "handler_name": "InShot Handler",
+                "vendor_id": "[0][0][0][0]",
+                "compatible_brands": "isomiso2avc1mp41",
+                "major_brand": "isom",
+                "minor_version": "512",
+                "comment": f"InShot {random.choice(['1.920.1389', '1.930.1400', '1.940.1410'])}",
+            },
+            {
+                # Kinemaster стиль
+                "encoder": "Kinemaster",
+                "handler_name": "Kinemaster Video Handler",
+                "vendor_id": "[0][0][0][0]",
+                "compatible_brands": "mp42isom",
+                "major_brand": "mp42",
+                "minor_version": "0",
+                "comment": f"Kinemaster {random.choice(['6.0.0', '6.1.0', '6.2.0', '7.0.0'])}",
+            },
+        ]
+
+        editor = random.choice(editors)
+
+        # Случайный ID устройства (как у мобильных устройств)
+        device_id = ''.join(random.choices('0123456789abcdef', k=16))
 
         return {
-            "title": f"{random.choice(adjectives)}_{random.choice(words)}_{uuid.uuid4().hex[:6]}",
-            "comment": f"{uuid.uuid4()}",
-            "author": f"user_{random.randint(10000, 99999)}",
-            "album": f"collection_{random.randint(1, 999)}",
-            "year": str(random.randint(2020, 2024)),
-            "creation_time": random_date.isoformat(),
-            "encoder": random.choice(["Lavf58", "Lavf59", "Lavf60", "HandBrake", "x264"]),
-            "description": f"{uuid.uuid4().hex}",
+            "title": "",  # Пустой title как у мобильных редакторов
+            "artist": "",
+            "album": "",
+            "comment": editor["comment"],
+            "creation_time": creation_time,
+            "encoder": editor["encoder"],
+            "handler_name": editor["handler_name"],
+            "compatible_brands": editor["compatible_brands"],
+            "major_brand": editor["major_brand"],
+            "minor_version": editor["minor_version"],
         }
 
     async def uniqueize(
@@ -728,6 +803,15 @@ class TikTokDownloader:
                         if duration > Config.MAX_VIDEO_DURATION:
                             continue
 
+                        # Получаем время создания видео
+                        create_time = v.get("create_time", 0)
+                        video_year = None
+                        if create_time:
+                            try:
+                                video_year = datetime.fromtimestamp(create_time).year
+                            except Exception:
+                                pass
+
                         videos.append({
                             "video_url": v.get("play", ""),
                             "author": v.get("author", {}).get("nickname", "Unknown"),
@@ -737,6 +821,8 @@ class TikTokDownloader:
                             "like_count": v.get("digg_count", 0),
                             "duration": duration,
                             "video_id": v.get("video_id", ""),
+                            "create_time": create_time,
+                            "year": video_year,
                         })
 
                     remaining -= len(batch_videos)
@@ -820,6 +906,55 @@ class QueueManager:
         self._user_queues: Dict[int, UserQueue] = {}
         self._processing_tasks: Dict[int, asyncio.Task] = {}
         self._delete_tasks: List[asyncio.Task] = []  # Задачи на удаление из storage
+        self._last_send_time: float = 0  # Время последней отправки
+
+    async def _send_document_with_retry(
+        self,
+        chat_id: int,
+        document: Any,
+        caption: str = None,
+        reply_markup: Any = None,
+        disable_notification: bool = False,
+        filename: str = None
+    ) -> Optional[Message]:
+        """
+        Отправить документ (файл) с обработкой flood control.
+        Видео отправляется как файл, чтобы сохранить качество и метаданные.
+        """
+        # Соблюдаем минимальную задержку между отправками
+        now = asyncio.get_event_loop().time()
+        elapsed = now - self._last_send_time
+        if elapsed < Config.SEND_DELAY:
+            await asyncio.sleep(Config.SEND_DELAY - elapsed)
+
+        for attempt in range(Config.MAX_RETRY_ATTEMPTS):
+            try:
+                # Если это FSInputFile, можно задать имя файла
+                if filename and hasattr(document, 'path'):
+                    document = FSInputFile(document.path, filename=filename)
+
+                result = await self.bot.send_document(
+                    chat_id=chat_id,
+                    document=document,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                    disable_notification=disable_notification
+                )
+                self._last_send_time = asyncio.get_event_loop().time()
+                return result
+
+            except TelegramRetryAfter as e:
+                wait_time = e.retry_after + 1  # +1 секунда для надежности
+                logger.warning(f"Flood control: waiting {wait_time}s (attempt {attempt + 1}/{Config.MAX_RETRY_ATTEMPTS})")
+                await asyncio.sleep(wait_time)
+
+            except Exception as e:
+                logger.error(f"Error sending document: {e}")
+                if attempt == Config.MAX_RETRY_ATTEMPTS - 1:
+                    raise
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+
+        return None
 
     def get_user_queue(self, user_id: int) -> UserQueue:
         """Получить очередь пользователя"""
@@ -954,18 +1089,25 @@ class QueueManager:
                 f"👥 User: {task.user_id}"
             )
 
-            video_file = FSInputFile(unique_path)
+            # Генерируем имя файла как у редактора
+            filename = f"CapCut_{random.randint(1000000, 9999999)}.mp4"
+            video_file = FSInputFile(unique_path, filename=filename)
 
-            # Отправляем в storage группу
-            storage_msg = await self.bot.send_video(
+            # Отправляем в storage группу как файл (с retry при flood control)
+            storage_msg = await self._send_document_with_retry(
                 chat_id=self.storage_chat_id,
-                video=video_file,
+                document=video_file,
                 caption=storage_caption,
-                supports_streaming=True,
                 disable_notification=True
             )
 
-            file_id = storage_msg.video.file_id
+            if not storage_msg:
+                task.status = "error"
+                task.error_message = "Не удалось отправить видео в storage"
+                await self._send_error(task)
+                return
+
+            file_id = storage_msg.document.file_id
 
             # Добавляем в кэш
             self.video_cache.add(
@@ -986,12 +1128,11 @@ class QueueManager:
             user_caption_parts.append("✅ Уникализировано")
             user_caption = "\n".join(user_caption_parts)
 
-            # Отправляем пользователю через file_id (быстро, без повторной загрузки)
-            await self.bot.send_video(
+            # Отправляем пользователю как файл (с retry при flood control)
+            await self._send_document_with_retry(
                 chat_id=task.chat_id,
-                video=file_id,
-                caption=user_caption,
-                supports_streaming=True
+                document=file_id,
+                caption=user_caption
             )
 
             # Планируем удаление из storage через 10 минут
@@ -1035,18 +1176,25 @@ class QueueManager:
                 f"👥 User: {task.user_id}"
             )
 
-            video_file = FSInputFile(downloaded_path)
+            # Для скачанных файлов используем оригинальное имя
+            filename = f"tiktok_{video_id}.mp4"
+            video_file = FSInputFile(downloaded_path, filename=filename)
 
-            # Отправляем в storage группу
-            storage_msg = await self.bot.send_video(
+            # Отправляем в storage группу как файл (с retry при flood control)
+            storage_msg = await self._send_document_with_retry(
                 chat_id=self.storage_chat_id,
-                video=video_file,
+                document=video_file,
                 caption=storage_caption,
-                supports_streaming=True,
                 disable_notification=True
             )
 
-            file_id = storage_msg.video.file_id
+            if not storage_msg:
+                task.status = "error"
+                task.error_message = "Не удалось отправить видео в storage"
+                await self._send_error(task)
+                return
+
+            file_id = storage_msg.document.file_id
 
             # Добавляем в кэш
             self.video_cache.add(
@@ -1077,13 +1225,12 @@ class QueueManager:
             builder.button(text="❌ Нет", callback_data=f"uq_skip:{short_file_id}")
             builder.adjust(1)
 
-            # Отправляем пользователю через file_id с кнопками
-            sent_msg = await self.bot.send_video(
+            # Отправляем пользователю как файл с кнопками (с retry при flood control)
+            sent_msg = await self._send_document_with_retry(
                 chat_id=task.chat_id,
-                video=file_id,
+                document=file_id,
                 caption=user_caption,
-                reply_markup=builder.as_markup(),
-                supports_streaming=True
+                reply_markup=builder.as_markup()
             )
 
             # Сохраняем данные видео для callback (через user_settings)
@@ -1160,18 +1307,25 @@ class QueueManager:
                 f"👥 User: {task.user_id}"
             )
 
-            video_file = FSInputFile(unique_path)
+            # Генерируем имя файла как у редактора
+            filename = f"CapCut_{random.randint(1000000, 9999999)}.mp4"
+            video_file = FSInputFile(unique_path, filename=filename)
 
-            # Отправляем в storage группу
-            storage_msg = await self.bot.send_video(
+            # Отправляем в storage группу как файл (с retry при flood control)
+            storage_msg = await self._send_document_with_retry(
                 chat_id=self.storage_chat_id,
-                video=video_file,
+                document=video_file,
                 caption=storage_caption,
-                supports_streaming=True,
                 disable_notification=True
             )
 
-            unique_file_id = storage_msg.video.file_id
+            if not storage_msg:
+                task.status = "error"
+                task.error_message = "Не удалось отправить видео в storage"
+                await self._send_error(task)
+                return
+
+            unique_file_id = storage_msg.document.file_id
 
             # Формируем caption для пользователя
             user_caption_parts = []
@@ -1182,12 +1336,11 @@ class QueueManager:
             user_caption_parts.append("✅ Уникализировано")
             user_caption = "\n".join(user_caption_parts)
 
-            # Отправляем пользователю
-            await self.bot.send_video(
+            # Отправляем пользователю как файл (с retry при flood control)
+            await self._send_document_with_retry(
                 chat_id=task.chat_id,
-                video=unique_file_id,
-                caption=user_caption,
-                supports_streaming=True
+                document=unique_file_id,
+                caption=user_caption
             )
 
             # Планируем удаление из storage
@@ -1399,32 +1552,56 @@ class TikTokBot:
             # Очищаем завершенные
             self.queue_manager.clear_completed(message.from_user.id)
 
-        # Главное меню - Настройки
-        @self.router.message(F.text == "⚙️ Настройки")
-        async def menu_settings(message: Message):
-            blur_enabled = self.user_settings.get_blur_background(message.from_user.id)
-            blur_status = "✅ Включен" if blur_enabled else "❌ Выключен"
+        # Вспомогательная функция для генерации настроек
+        def _get_settings_text_and_keyboard(user_id: int):
+            blur_enabled = self.user_settings.get_blur_background(user_id)
+            blur_status = "✅ Вкл" if blur_enabled else "❌ Выкл"
+
+            year_filter = self.user_settings.get_year_filter(user_id)
+            year_mode = year_filter.get("mode", "off")
+            year_value = year_filter.get("year")
+
+            if year_mode == "off":
+                year_status = "❌ Выключен"
+            elif year_mode == "only":
+                year_status = f"✅ Только {year_value}"
+            elif year_mode == "exclude":
+                year_status = f"🚫 Исключить {year_value}"
+            else:
+                year_status = "❌ Выключен"
 
             builder = InlineKeyboardBuilder()
             builder.button(
                 text=f"{'🔵' if blur_enabled else '⚪'} Размытый фон: {blur_status}",
                 callback_data="toggle_blur"
             )
+            builder.button(
+                text=f"📅 Фильтр по году: {year_status}",
+                callback_data="year_filter_menu"
+            )
             builder.button(text="◀️ Назад", callback_data="back_to_menu")
             builder.adjust(1)
 
             overlays_count = len(self.uniqueizer._overlay_images)
 
-            await message.answer(
+            text = (
                 "⚙️ **Настройки**\n\n"
                 f"**Размытый фон:** {blur_status}\n"
                 "При включении видео будет со смещением на размытом фоне\n\n"
+                f"**Фильтр по году:** {year_status}\n"
+                "Фильтрация видео по году публикации\n\n"
                 f"**Overlay изображений:** {overlays_count} шт.\n"
                 f"Папка: `{Config.OVERLAYS_DIR}`\n\n"
-                "Положите 2-10 изображений в папку overlays для уникализации.",
-                reply_markup=builder.as_markup(),
-                parse_mode="Markdown"
+                "Положите 2-10 изображений в папку overlays для уникализации."
             )
+
+            return text, builder.as_markup()
+
+        # Главное меню - Настройки
+        @self.router.message(F.text == "⚙️ Настройки")
+        async def menu_settings(message: Message):
+            text, keyboard = _get_settings_text_and_keyboard(message.from_user.id)
+            await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
         # Переключение размытого фона
         @self.router.callback_query(F.data == "toggle_blur")
@@ -1433,29 +1610,118 @@ class TikTokBot:
             new_value = not current
             self.user_settings.set_blur_background(callback.from_user.id, new_value)
 
-            blur_status = "✅ Включен" if new_value else "❌ Выключен"
+            text, keyboard = _get_settings_text_and_keyboard(callback.from_user.id)
+            await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+            await callback.answer(f"Размытый фон {'включен' if new_value else 'выключен'}")
+
+        # Меню фильтра по году
+        @self.router.callback_query(F.data == "year_filter_menu")
+        async def year_filter_menu(callback: CallbackQuery):
+            year_filter = self.user_settings.get_year_filter(callback.from_user.id)
+            current_mode = year_filter.get("mode", "off")
+            current_year = year_filter.get("year")
 
             builder = InlineKeyboardBuilder()
-            builder.button(
-                text=f"{'🔵' if new_value else '⚪'} Размытый фон: {blur_status}",
-                callback_data="toggle_blur"
-            )
-            builder.button(text="◀️ Назад", callback_data="back_to_menu")
-            builder.adjust(1)
 
-            overlays_count = len(self.uniqueizer._overlay_images)
+            # Кнопки для выбора года (последние 5 лет)
+            current_year_now = datetime.now().year
+            years = [current_year_now - i for i in range(5)]
+
+            for year in years:
+                # Показываем статус для каждого года
+                if current_mode == "only" and current_year == year:
+                    prefix = "✅ Только "
+                elif current_mode == "exclude" and current_year == year:
+                    prefix = "🚫 Исключить "
+                else:
+                    prefix = ""
+                builder.button(text=f"{prefix}{year}", callback_data=f"year_select:{year}")
+
+            builder.adjust(3, 2)
+
+            # Кнопки режимов
+            builder.row(
+                InlineKeyboardButton(
+                    text="✅ Только выбранный" if current_mode == "only" else "Только выбранный",
+                    callback_data="year_mode:only"
+                ),
+                InlineKeyboardButton(
+                    text="🚫 Исключить выбранный" if current_mode == "exclude" else "Исключить выбранный",
+                    callback_data="year_mode:exclude"
+                )
+            )
+            builder.row(
+                InlineKeyboardButton(text="❌ Сбросить фильтр", callback_data="year_mode:off")
+            )
+            builder.row(
+                InlineKeyboardButton(text="◀️ Назад к настройкам", callback_data="back_to_settings")
+            )
+
+            mode_text = {
+                "off": "выключен",
+                "only": f"показывать только {current_year}",
+                "exclude": f"исключить {current_year}"
+            }.get(current_mode, "выключен")
 
             await callback.message.edit_text(
-                "⚙️ **Настройки**\n\n"
-                f"**Размытый фон:** {blur_status}\n"
-                "При включении видео будет со смещением на размытом фоне\n\n"
-                f"**Overlay изображений:** {overlays_count} шт.\n"
-                f"Папка: `{Config.OVERLAYS_DIR}`\n\n"
-                "Положите 2-10 изображений в папку overlays для уникализации.",
+                "📅 **Фильтр по году**\n\n"
+                f"Текущий режим: **{mode_text}**\n\n"
+                "1. Выберите год\n"
+                "2. Выберите режим:\n"
+                "   • **Только выбранный** - парсить только видео этого года\n"
+                "   • **Исключить выбранный** - не парсить видео этого года\n\n"
+                "Это поможет находить свежий или наоборот старый контент.",
                 reply_markup=builder.as_markup(),
                 parse_mode="Markdown"
             )
-            await callback.answer(f"Размытый фон {'включен' if new_value else 'выключен'}")
+            await callback.answer()
+
+        # Выбор года
+        @self.router.callback_query(F.data.startswith("year_select:"))
+        async def year_select(callback: CallbackQuery):
+            year = int(callback.data.split(":")[1])
+            year_filter = self.user_settings.get_year_filter(callback.from_user.id)
+            current_mode = year_filter.get("mode", "off")
+
+            # Если режим не выбран, ставим "only" по умолчанию
+            if current_mode == "off":
+                current_mode = "only"
+
+            self.user_settings.set_year_filter(callback.from_user.id, current_mode, year)
+            await callback.answer(f"Выбран год: {year}")
+
+            # Обновляем меню
+            await year_filter_menu(callback)
+
+        # Выбор режима фильтра
+        @self.router.callback_query(F.data.startswith("year_mode:"))
+        async def year_mode_select(callback: CallbackQuery):
+            mode = callback.data.split(":")[1]
+            year_filter = self.user_settings.get_year_filter(callback.from_user.id)
+            current_year = year_filter.get("year")
+
+            if mode == "off":
+                self.user_settings.clear_year_filter(callback.from_user.id)
+                await callback.answer("Фильтр по году отключен")
+            else:
+                if current_year:
+                    self.user_settings.set_year_filter(callback.from_user.id, mode, current_year)
+                    await callback.answer(f"Режим: {'только' if mode == 'only' else 'исключить'} {current_year}")
+                else:
+                    # Если год не выбран, выбираем текущий
+                    current_year = datetime.now().year
+                    self.user_settings.set_year_filter(callback.from_user.id, mode, current_year)
+                    await callback.answer(f"Выбран год {current_year}")
+
+            # Обновляем меню
+            await year_filter_menu(callback)
+
+        # Назад к настройкам
+        @self.router.callback_query(F.data == "back_to_settings")
+        async def back_to_settings(callback: CallbackQuery):
+            text, keyboard = _get_settings_text_and_keyboard(callback.from_user.id)
+            await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+            await callback.answer()
 
         # Назад в меню
         @self.router.callback_query(F.data == "back_to_menu")
@@ -1866,12 +2132,37 @@ class TikTokBot:
             # Фильтруем уже отправленные пользователю видео
             new_videos = self.video_cache.filter_new_videos(videos, user_id)
 
+            # Применяем фильтр по году
+            year_filter = self.user_settings.get_year_filter(user_id)
+            year_mode = year_filter.get("mode", "off")
+            filter_year = year_filter.get("year")
+            year_filtered_count = 0
+
+            if year_mode != "off" and filter_year:
+                filtered_by_year = []
+                for v in new_videos:
+                    video_year = v.get("year")
+                    if video_year is None:
+                        # Если год не определен, пропускаем фильтрацию
+                        filtered_by_year.append(v)
+                    elif year_mode == "only" and video_year == filter_year:
+                        filtered_by_year.append(v)
+                    elif year_mode == "exclude" and video_year != filter_year:
+                        filtered_by_year.append(v)
+
+                year_filtered_count = len(new_videos) - len(filtered_by_year)
+                new_videos = filtered_by_year
+
             if not new_videos:
                 cache_stats = self.video_cache.get_stats(user_id)
+                year_info = ""
+                if year_mode != "off":
+                    year_info = f"\n📅 Фильтр года: {'только' if year_mode == 'only' else 'исключить'} {filter_year}"
+
                 await status_message.edit_text(
-                    f"😔 По запросу **{query}** все найденные видео уже были отправлены.\n\n"
-                    f"📊 В кэше: {cache_stats['user']} ваших видео\n"
-                    f"Попробуйте другой запрос.",
+                    f"😔 По запросу **{query}** подходящих видео не найдено.\n\n"
+                    f"📊 В кэше: {cache_stats['user']} ваших видео{year_info}\n"
+                    f"Попробуйте другой запрос или измените фильтр года в настройках.",
                     parse_mode="Markdown"
                 )
                 await state.clear()
@@ -1880,9 +2171,18 @@ class TikTokBot:
             # Берем нужное количество новых видео
             videos_to_send = new_videos[:count]
 
+            # Формируем информацию о фильтрации
+            skip_info_parts = []
+            cache_skipped = len(videos) - len(new_videos) - year_filtered_count
+            if cache_skipped > 0:
+                skip_info_parts.append(f"{cache_skipped} уже отправленных")
+            if year_filtered_count > 0:
+                skip_info_parts.append(f"{year_filtered_count} по фильтру года")
+            skip_info = f"(пропущено: {', '.join(skip_info_parts)})" if skip_info_parts else ""
+
             await status_message.edit_text(
                 f"✅ Найдено **{len(videos_to_send)}** новых видео!\n"
-                f"(пропущено {len(videos) - len(new_videos)} уже отправленных)\n\n"
+                f"{skip_info}\n\n"
                 f"Добавляю в очередь на обработку...",
                 parse_mode="Markdown"
             )
