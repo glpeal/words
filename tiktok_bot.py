@@ -1002,7 +1002,7 @@ class QueueManager:
             except Exception as e:
                 logger.error(f"Error sending document: {e}")
                 if attempt == Config.MAX_RETRY_ATTEMPTS - 1:
-                    raise
+                    return None
                 await asyncio.sleep(2 ** attempt)  # Exponential backoff
 
         return None
@@ -1047,7 +1047,7 @@ class QueueManager:
             except Exception as e:
                 logger.error(f"Error sending video: {e}")
                 if attempt == Config.MAX_RETRY_ATTEMPTS - 1:
-                    raise
+                    return None
                 await asyncio.sleep(2 ** attempt)
 
         return None
