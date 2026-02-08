@@ -1153,7 +1153,7 @@ class QueueManager:
                 disable_notification=True
             )
 
-            if not storage_msg:
+            if not storage_msg or not storage_msg.document:
                 task.status = "error"
                 task.error_message = "Не удалось отправить видео в storage"
                 await self._send_error(task)
@@ -1240,7 +1240,7 @@ class QueueManager:
                 disable_notification=True
             )
 
-            if not storage_msg:
+            if not storage_msg or not storage_msg.document:
                 task.status = "error"
                 task.error_message = "Не удалось отправить видео в storage"
                 await self._send_error(task)
@@ -1284,6 +1284,12 @@ class QueueManager:
                 caption=user_caption,
                 reply_markup=builder.as_markup()
             )
+
+            if not sent_msg:
+                task.status = "error"
+                task.error_message = "Не удалось отправить видео пользователю"
+                await self._send_error(task)
+                return
 
             # Сохраняем данные видео для callback (через user_settings)
             if self.user_settings:
@@ -1372,7 +1378,7 @@ class QueueManager:
                 disable_notification=True
             )
 
-            if not storage_msg:
+            if not storage_msg or not storage_msg.document:
                 task.status = "error"
                 task.error_message = "Не удалось отправить видео в storage"
                 await self._send_error(task)
