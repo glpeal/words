@@ -1058,7 +1058,8 @@ class QueueManager:
         caption: str = None,
         reply_markup: Any = None,
         disable_notification: bool = False,
-        filename: str = None
+        filename: str = None,
+        disable_content_type_detection: bool = False
     ) -> Optional[Message]:
         """
         Отправить документ (файл) с обработкой flood control.
@@ -1081,7 +1082,8 @@ class QueueManager:
                     document=document,
                     caption=caption,
                     reply_markup=reply_markup,
-                    disable_notification=disable_notification
+                    disable_notification=disable_notification,
+                    disable_content_type_detection=disable_content_type_detection
                 )
                 self._last_send_time = asyncio.get_event_loop().time()
                 return result
@@ -1336,12 +1338,13 @@ class QueueManager:
                 user_id=task.user_id
             )
 
-            # Отправляем пользователю ФАЙЛ напрямую (не через file_id!)
+            # Отправляем пользователю ФАЙЛ напрямую (без превью видео!)
             user_file = FSInputFile(unique_path, filename=filename)
             await self._send_document_with_retry(
                 chat_id=task.chat_id,
                 document=user_file,
-                caption=None  # Без подписи - только файл!
+                caption=None,
+                disable_content_type_detection=True  # Отправить как чистый файл без превью!
             )
 
             # Планируем удаление из storage через 10 минут
@@ -1581,13 +1584,13 @@ class QueueManager:
 
             logger.info(f"[Uniqueize] Sent to storage, file_id={unique_file_id[:30]}...")
 
-            # Отправляем пользователю ФАЙЛ напрямую (не через file_id!)
-            # Так Telegram точно отправит как document, а не video
+            # Отправляем пользователю ФАЙЛ напрямую (без превью видео!)
             user_file = FSInputFile(unique_path, filename=filename)
             await self._send_document_with_retry(
                 chat_id=task.chat_id,
                 document=user_file,
-                caption=None  # Без подписи - только файл!
+                caption=None,
+                disable_content_type_detection=True  # Отправить как чистый файл без превью!
             )
 
             # Планируем удаление из storage
