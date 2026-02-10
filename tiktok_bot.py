@@ -607,6 +607,7 @@ class VideoUniqueizer:
             use_snow_effect=use_snow_effect
         )
 
+        logger.info(f"FFmpeg processing: {input_path} -> {output_path}")
         logger.debug(f"FFmpeg command: {' '.join(cmd)}")
 
         try:
@@ -622,20 +623,30 @@ class VideoUniqueizer:
             )
 
             if process.returncode != 0:
-                logger.error(f"FFmpeg error: {stderr.decode()}")
+                logger.error(f"FFmpeg failed with code {process.returncode}")
+                logger.error(f"FFmpeg stderr: {stderr.decode()}")
                 return None
 
             # Проверяем что файл создан
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                return output_path
-
-            return None
+            if os.path.exists(output_path):
+                file_size = os.path.getsize(output_path)
+                if file_size > 0:
+                    logger.info(f"FFmpeg success: created {output_path} ({file_size} bytes)")
+                    return output_path
+                else:
+                    logger.error(f"FFmpeg created empty file: {output_path}")
+                    return None
+            else:
+                logger.error(f"FFmpeg did not create output file: {output_path}")
+                return None
 
         except asyncio.TimeoutError:
-            logger.error("FFmpeg timeout")
+            logger.error("FFmpeg timeout (5 min)")
             return None
         except Exception as e:
             logger.error(f"FFmpeg exception: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
     def _build_ffmpeg_command(
@@ -695,23 +706,20 @@ class VideoUniqueizer:
             )
             current_label = next_label
 
-        # Добавляем эффект снега (плавающая точка)
+        # Добавляем эффект снега (плавающая точка с движением)
         if use_snow_effect:
             snow_label = current_label.strip("[]")
             # Случайные параметры для уникального движения
-            speed_x = random.uniform(0.3, 0.7)  # Скорость по X
-            speed_y = random.uniform(0.2, 0.5)  # Скорость по Y
-            phase_x = random.uniform(0, 6.28)   # Начальная фаза X (0-2π)
-            phase_y = random.uniform(0, 6.28)   # Начальная фаза Y
-            # Маленькая точка движущаяся плавно по синусоиде
-            # Размер точки 2-4 пикселя, прозрачность 10%
+            speed_x = random.uniform(30, 70)  # Скорость по X (пикселей/сек)
+            speed_y = random.uniform(20, 50)  # Скорость по Y (пикселей/сек)
+            start_x = random.randint(100, 400)  # Начальная позиция X
+            start_y = random.randint(100, 300)  # Начальная позиция Y
             dot_size = random.randint(2, 4)
-            # drawbox с движением: x и y вычисляются через sin/cos от времени
-            # Точка двигается от центра с амплитудой W/3 и H/3
+            # Точка движется по синусоиде - используем mod для зацикливания
             filter_parts.append(
                 f"[{snow_label}]drawbox="
-                f"x='W/2+W/3*sin({speed_x}*t+{phase_x:.2f})-{dot_size/2}':"
-                f"y='H/2+H/3*cos({speed_y}*t+{phase_y:.2f})-{dot_size/2}':"
+                f"x=mod({start_x}+{speed_x:.1f}*t\\,iw-{dot_size}):"
+                f"y=mod({start_y}+{speed_y:.1f}*t\\,ih-{dot_size}):"
                 f"w={dot_size}:h={dot_size}:"
                 f"color=white@0.1:t=fill[snow]"
             )
@@ -725,15 +733,15 @@ class VideoUniqueizer:
         if not overlays:
             snow_filter = ""
             if use_snow_effect:
-                speed_x = random.uniform(0.3, 0.7)
-                speed_y = random.uniform(0.2, 0.5)
-                phase_x = random.uniform(0, 6.28)
-                phase_y = random.uniform(0, 6.28)
+                speed_x = random.uniform(30, 70)
+                speed_y = random.uniform(20, 50)
+                start_x = random.randint(100, 400)
+                start_y = random.randint(100, 300)
                 dot_size = random.randint(2, 4)
                 snow_filter = (
                     f",drawbox="
-                    f"x='W/2+W/3*sin({speed_x}*t+{phase_x:.2f})-{dot_size/2}':"
-                    f"y='H/2+H/3*cos({speed_y}*t+{phase_y:.2f})-{dot_size/2}':"
+                    f"x=mod({start_x}+{speed_x:.1f}*t\\,iw-{dot_size}):"
+                    f"y=mod({start_y}+{speed_y:.1f}*t\\,ih-{dot_size}):"
                     f"w={dot_size}:h={dot_size}:"
                     f"color=white@0.1:t=fill"
                 )
@@ -1066,7 +1074,9 @@ class QueueManager:
                 await asyncio.sleep(wait_time)
 
             except Exception as e:
-                logger.error(f"Error sending document: {e}")
+                logger.error(f"Error sending document (attempt {attempt + 1}/{Config.MAX_RETRY_ATTEMPTS}): {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
                 if attempt == Config.MAX_RETRY_ATTEMPTS - 1:
                     return None
                 await asyncio.sleep(2 ** attempt)  # Exponential backoff
@@ -1254,6 +1264,18 @@ class QueueManager:
 
             # Генерируем имя файла как у редактора
             filename = f"CapCut_{random.randint(1000000, 9999999)}.mp4"
+
+            # Проверяем что файл существует
+            if not os.path.exists(unique_path):
+                logger.error(f"[Task] Uniqueized file does not exist: {unique_path}")
+                task.status = "error"
+                task.error_message = "Файл не был создан"
+                await self._send_error(task)
+                return
+
+            file_size = os.path.getsize(unique_path)
+            logger.info(f"[Task] Sending file: {unique_path}, size: {file_size} bytes, to storage: {self.storage_chat_id}")
+
             video_file = FSInputFile(unique_path, filename=filename)
 
             # Отправляем в storage группу как файл (с retry при flood control)
@@ -1265,6 +1287,7 @@ class QueueManager:
             )
 
             if not storage_msg or not storage_msg.document:
+                logger.error(f"[Task] Failed to send to storage. storage_msg={storage_msg}")
                 task.status = "error"
                 task.error_message = "Не удалось отправить видео в storage"
                 await self._send_error(task)
@@ -1444,14 +1467,26 @@ class QueueManager:
 
         try:
             task.status = "downloading"
+            logger.info(f"[Uniqueize] Starting task {task.task_id}, file_id={task.file_id[:20] if task.file_id else 'None'}...")
 
             # Скачиваем файл из Telegram
             downloaded_path = str(self.uniqueizer.temp_dir / f"tg_{uuid.uuid4().hex[:8]}.mp4")
             file = await self.bot.get_file(task.file_id)
+            logger.info(f"[Uniqueize] Downloading from Telegram: {file.file_path}")
             await self.bot.download_file(file.file_path, downloaded_path)
+
+            if os.path.exists(downloaded_path):
+                logger.info(f"[Uniqueize] Downloaded: {downloaded_path}, size: {os.path.getsize(downloaded_path)} bytes")
+            else:
+                logger.error(f"[Uniqueize] Failed to download file to {downloaded_path}")
+                task.status = "error"
+                task.error_message = "Не удалось скачать файл из Telegram"
+                await self._send_error(task)
+                return
 
             # Уникализация
             task.status = "processing"
+            logger.info(f"[Uniqueize] Processing with blur={task.use_blur_background}, snow={task.use_snow_effect}")
             unique_path = await self.uniqueizer.uniqueize(
                 downloaded_path,
                 use_blur_background=task.use_blur_background,
@@ -1459,6 +1494,7 @@ class QueueManager:
             )
 
             if not unique_path:
+                logger.error(f"[Uniqueize] FFmpeg failed for task {task.task_id}")
                 task.status = "error"
                 task.error_message = "Не удалось обработать видео"
                 await self._send_error(task)
@@ -1478,6 +1514,18 @@ class QueueManager:
 
             # Генерируем имя файла как у редактора
             filename = f"CapCut_{random.randint(1000000, 9999999)}.mp4"
+
+            # Проверяем что файл существует
+            if not os.path.exists(unique_path):
+                logger.error(f"Uniqueized file does not exist: {unique_path}")
+                task.status = "error"
+                task.error_message = "Файл не был создан"
+                await self._send_error(task)
+                return
+
+            file_size = os.path.getsize(unique_path)
+            logger.info(f"[Uniqueize] Sending file: {unique_path}, size: {file_size} bytes, to storage: {self.storage_chat_id}")
+
             video_file = FSInputFile(unique_path, filename=filename)
 
             # Отправляем в storage группу как файл (с retry при flood control)
@@ -1489,6 +1537,7 @@ class QueueManager:
             )
 
             if not storage_msg or not storage_msg.document:
+                logger.error(f"[Uniqueize] Failed to send to storage. storage_msg={storage_msg}")
                 task.status = "error"
                 task.error_message = "Не удалось отправить видео в storage"
                 await self._send_error(task)
@@ -2471,6 +2520,25 @@ class TikTokBot:
 
         # Создаем временную директорию
         Path(Config.TEMP_DIR).mkdir(parents=True, exist_ok=True)
+
+        # Проверяем доступ к storage каналу
+        try:
+            chat = await self.bot.get_chat(self.storage_chat_id)
+            logger.info(f"Storage channel access OK: {chat.title} (ID: {self.storage_chat_id})")
+        except Exception as e:
+            logger.error(f"Cannot access storage channel {self.storage_chat_id}: {e}")
+            logger.error("Please check STORAGE_CHAT_ID in Config and make sure the bot is admin in that channel")
+            print("=" * 50)
+            print(f"ОШИБКА: Не могу получить доступ к storage каналу!")
+            print(f"Storage ID: {self.storage_chat_id}")
+            print(f"Ошибка: {e}")
+            print()
+            print("Убедитесь что:")
+            print("1. STORAGE_CHAT_ID указан правильно")
+            print("2. Бот добавлен в этот канал/группу как администратор")
+            print("3. У бота есть права на отправку сообщений")
+            print("=" * 50)
+            return
 
         try:
             await self.dp.start_polling(self.bot)
