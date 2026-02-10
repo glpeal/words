@@ -706,18 +706,18 @@ class VideoUniqueizer:
             )
             current_label = next_label
 
-        # Добавляем эффект снега (маленькая белая точка движущаяся по экрану)
+        # Добавляем эффект снега (маленькая белая точка на видео)
         if use_snow_effect:
             snow_label = current_label.strip("[]")
-            # Используем geq фильтр для создания движущейся точки
-            # Или простой drawbox с фиксированной позицией но рандомной для каждого видео
-            dot_x = random.randint(50, 200)
-            dot_y = random.randint(50, 150)
-            dot_size = random.randint(2, 4)
-            # Простой drawbox в случайной позиции - работает надежно
+            # Точка в случайной позиции, достаточно большая чтобы быть заметной
+            # Позиция в процентах от размера видео для совместимости
+            dot_x_pct = random.randint(5, 25)  # 5-25% от ширины
+            dot_y_pct = random.randint(5, 20)  # 5-20% от высоты
+            dot_size = random.randint(5, 8)  # Размер 5-8 пикселей (видимый)
+            # drawbox с позицией в процентах от размера
             filter_parts.append(
-                f"[{snow_label}]drawbox=x={dot_x}:y={dot_y}:w={dot_size}:h={dot_size}:"
-                f"color=white@0.1:t=fill[snow]"
+                f"[{snow_label}]drawbox=x=iw*{dot_x_pct}/100:y=ih*{dot_y_pct}/100:"
+                f"w={dot_size}:h={dot_size}:color=white@0.10:t=fill[snow]"
             )
             current_label = "[snow]"
 
@@ -741,12 +741,12 @@ class VideoUniqueizer:
         if not overlays:
             snow_filter = ""
             if use_snow_effect:
-                dot_x = random.randint(50, 200)
-                dot_y = random.randint(50, 150)
-                dot_size = random.randint(2, 4)
+                dot_x_pct = random.randint(5, 25)
+                dot_y_pct = random.randint(5, 20)
+                dot_size = random.randint(5, 8)
                 snow_filter = (
-                    f",drawbox=x={dot_x}:y={dot_y}:w={dot_size}:h={dot_size}:"
-                    f"color=white@0.1:t=fill"
+                    f",drawbox=x=iw*{dot_x_pct}/100:y=ih*{dot_y_pct}/100:"
+                    f"w={dot_size}:h={dot_size}:color=white@0.10:t=fill"
                 )
 
             # Цветокоррекция для случая без overlay
