@@ -29,7 +29,7 @@ import random
 import tempfile
 import shutil
 import logging
-from typing import Optional, Dict, Any, List, Callable
+from typing import Optional, Dict, Any, List, Callable, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -889,6 +889,72 @@ class TikTokDownloader:
                 break
 
         return videos[:count]
+
+    async def search_videos_batch(
+        self,
+        query: str,
+        count: int = 30,
+        cursor: int = 0
+    ) -> Tuple[List[Dict[str, Any]], int, bool]:
+        """
+        Поиск видео с поддержкой пагинации.
+        Возвращает (videos, next_cursor, has_more)
+        """
+        session = await self._get_session()
+        query = query.lstrip('#')
+        videos = []
+        next_cursor = cursor
+        has_more = False
+
+        try:
+            async with session.post(
+                self.TIKWM_FEED_API,
+                data={"keywords": query, "count": count, "cursor": cursor, "hd": 1}
+            ) as response:
+                if response.status != 200:
+                    return videos, next_cursor, False
+
+                data = await response.json()
+                if data.get("code") != 0:
+                    return videos, next_cursor, False
+
+                batch_videos = data.get("data", {}).get("videos", [])
+                if not batch_videos:
+                    return videos, next_cursor, False
+
+                for v in batch_videos:
+                    duration = v.get("duration", 0)
+                    if duration > Config.MAX_VIDEO_DURATION:
+                        continue
+
+                    create_time = v.get("create_time", 0)
+                    video_year = None
+                    if create_time:
+                        try:
+                            video_year = datetime.fromtimestamp(create_time).year
+                        except Exception:
+                            pass
+
+                    videos.append({
+                        "video_url": v.get("play", ""),
+                        "author": v.get("author", {}).get("nickname", "Unknown"),
+                        "author_id": v.get("author", {}).get("unique_id", ""),
+                        "title": v.get("title", ""),
+                        "play_count": v.get("play_count", 0),
+                        "like_count": v.get("digg_count", 0),
+                        "duration": duration,
+                        "video_id": v.get("video_id", ""),
+                        "create_time": create_time,
+                        "year": video_year,
+                    })
+
+                next_cursor = data.get("data", {}).get("cursor", cursor + count)
+                has_more = data.get("data", {}).get("hasMore", False)
+
+        except Exception as e:
+            logger.error(f"Error searching videos batch: {e}")
+
+        return videos, next_cursor, has_more
 
     async def download_video(self, video_url: str) -> Optional[str]:
         """Скачать видео во временный файл"""
@@ -2245,45 +2311,79 @@ class TikTokBot:
         user_id: int,
         state: FSMContext
     ):
-        """Запустить парсинг видео"""
+        """Запустить парсинг видео с прогрессивным поиском"""
         try:
-            # Поиск видео (запрашиваем больше, чтобы отфильтровать уже отправленные)
-            search_count = min(count * 2, 100)  # Ищем в 2 раза больше
-            videos = await self.downloader.search_videos(query, search_count)
-
-            if not videos:
-                await status_message.edit_text(
-                    f"😔 По запросу **{query}** видео не найдено.\n"
-                    "Попробуйте другой запрос.",
-                    parse_mode="Markdown"
-                )
-                await state.clear()
-                return
-
-            # Фильтруем уже отправленные пользователю видео
-            new_videos = self.video_cache.filter_new_videos(videos, user_id)
-
-            # Применяем фильтр по году
+            # Получаем настройки фильтра года
             year_filter = self.user_settings.get_year_filter(user_id)
             year_mode = year_filter.get("mode", "off")
             filter_year = year_filter.get("year")
+
+            # Список для сбора новых видео
+            new_videos = []
+            cursor = 0
+            has_more = True
+            total_searched = 0
+            cache_skipped = 0
             year_filtered_count = 0
+            max_pages = 10  # Максимум страниц поиска (защита от бесконечного цикла)
+            pages_searched = 0
 
-            if year_mode != "off" and filter_year:
-                filtered_by_year = []
-                for v in new_videos:
-                    video_year = v.get("year")
-                    if video_year is None:
-                        # Если год не определен, пропускаем фильтрацию
-                        filtered_by_year.append(v)
-                    elif year_mode == "only" and video_year == filter_year:
-                        filtered_by_year.append(v)
-                    elif year_mode == "exclude" and video_year != filter_year:
-                        filtered_by_year.append(v)
+            await status_message.edit_text(
+                f"🔍 Поиск видео по запросу: **{query}**\n"
+                f"Цель: {count} новых видео...",
+                parse_mode="Markdown"
+            )
 
-                year_filtered_count = len(new_videos) - len(filtered_by_year)
-                new_videos = filtered_by_year
+            # Прогрессивный поиск пока не наберём нужное количество
+            while len(new_videos) < count and has_more and pages_searched < max_pages:
+                pages_searched += 1
 
+                # Получаем пакет видео
+                batch_videos, cursor, has_more = await self.downloader.search_videos_batch(
+                    query, count=30, cursor=cursor
+                )
+
+                if not batch_videos:
+                    break
+
+                total_searched += len(batch_videos)
+
+                # Фильтруем уже отправленные пользователю видео
+                filtered_batch = self.video_cache.filter_new_videos(batch_videos, user_id)
+                batch_cache_skipped = len(batch_videos) - len(filtered_batch)
+                cache_skipped += batch_cache_skipped
+
+                # Применяем фильтр по году
+                if year_mode != "off" and filter_year:
+                    year_filtered_batch = []
+                    for v in filtered_batch:
+                        video_year = v.get("year")
+                        if video_year is None:
+                            year_filtered_batch.append(v)
+                        elif year_mode == "only" and video_year == filter_year:
+                            year_filtered_batch.append(v)
+                        elif year_mode == "exclude" and video_year != filter_year:
+                            year_filtered_batch.append(v)
+
+                    year_filtered_count += len(filtered_batch) - len(year_filtered_batch)
+                    filtered_batch = year_filtered_batch
+
+                # Добавляем отфильтрованные видео (только то, что нужно)
+                remaining = count - len(new_videos)
+                new_videos.extend(filtered_batch[:remaining])
+
+                # Обновляем статус поиска
+                if len(new_videos) < count and has_more:
+                    await status_message.edit_text(
+                        f"🔍 Поиск видео по запросу: **{query}**\n"
+                        f"Найдено: {len(new_videos)}/{count}\n"
+                        f"Просмотрено: {total_searched} видео\n"
+                        f"⏳ Продолжаем поиск...",
+                        parse_mode="Markdown"
+                    )
+                    await asyncio.sleep(0.5)  # Небольшая задержка между запросами
+
+            # Проверяем результаты
             if not new_videos:
                 cache_stats = self.video_cache.get_stats(user_id)
                 year_info = ""
@@ -2292,6 +2392,7 @@ class TikTokBot:
 
                 await status_message.edit_text(
                     f"😔 По запросу **{query}** подходящих видео не найдено.\n\n"
+                    f"🔍 Просмотрено: {total_searched} видео\n"
                     f"📊 В кэше: {cache_stats['user']} ваших видео{year_info}\n"
                     f"Попробуйте другой запрос или измените фильтр года в настройках.",
                     parse_mode="Markdown"
@@ -2299,12 +2400,8 @@ class TikTokBot:
                 await state.clear()
                 return
 
-            # Берем нужное количество новых видео
-            videos_to_send = new_videos[:count]
-
             # Формируем информацию о фильтрации
             skip_info_parts = []
-            cache_skipped = len(videos) - len(new_videos) - year_filtered_count
             if cache_skipped > 0:
                 skip_info_parts.append(f"{cache_skipped} уже отправленных")
             if year_filtered_count > 0:
@@ -2312,7 +2409,8 @@ class TikTokBot:
             skip_info = f"(пропущено: {', '.join(skip_info_parts)})" if skip_info_parts else ""
 
             await status_message.edit_text(
-                f"✅ Найдено **{len(videos_to_send)}** новых видео!\n"
+                f"✅ Найдено **{len(new_videos)}** новых видео!\n"
+                f"🔍 Просмотрено: {total_searched} видео\n"
                 f"{skip_info}\n\n"
                 f"Добавляю в очередь на обработку...",
                 parse_mode="Markdown"
@@ -2322,7 +2420,7 @@ class TikTokBot:
             use_blur = self.user_settings.get_blur_background(user_id)
             use_snow = self.user_settings.get_snow_effect(user_id)
             added = 0
-            for video in videos_to_send:
+            for video in new_videos:
                 task = VideoTask(
                     task_id="",
                     user_id=user_id,
@@ -2341,16 +2439,24 @@ class TikTokBot:
                     added += 1
 
             cache_stats = self.video_cache.get_stats(user_id)
-            await status_message.edit_text(
+            final_msg = (
                 f"✅ **Готово!**\n\n"
                 f"🔍 Запрос: {query}\n"
                 f"📦 Добавлено в очередь: {added} видео\n"
+                f"🔎 Просмотрено: {total_searched} видео\n"
                 f"💾 В кэше: {cache_stats['user']} ваших видео\n\n"
+            )
+
+            if added < count:
+                final_msg += f"⚠️ Найдено меньше видео чем запрошено (закончились результаты поиска)\n\n"
+
+            final_msg += (
                 f"Видео будут скачаны и отправлены.\n"
                 f"Под каждым видео будет кнопка для добавления в уникализацию.\n"
-                f"Потом перейдите в 🔄 Уникализация и нажмите 'Уникализировать все'",
-                parse_mode="Markdown"
+                f"Потом перейдите в 🔄 Уникализация и нажмите 'Уникализировать все'"
             )
+
+            await status_message.edit_text(final_msg, parse_mode="Markdown")
 
         except Exception as e:
             logger.error(f"Error in parsing: {e}")
