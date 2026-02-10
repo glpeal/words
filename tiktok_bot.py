@@ -1286,14 +1286,27 @@ class QueueManager:
                 disable_notification=True
             )
 
-            if not storage_msg or not storage_msg.document:
-                logger.error(f"[Task] Failed to send to storage. storage_msg={storage_msg}")
+            # Telegram может вернуть document или video в зависимости от файла
+            if not storage_msg:
+                logger.error(f"[Task] Failed to send to storage - no response")
                 task.status = "error"
                 task.error_message = "Не удалось отправить видео в storage"
                 await self._send_error(task)
                 return
 
-            file_id = storage_msg.document.file_id
+            # Получаем file_id (может быть document или video)
+            if storage_msg.document:
+                file_id = storage_msg.document.file_id
+            elif storage_msg.video:
+                file_id = storage_msg.video.file_id
+            else:
+                logger.error(f"[Task] No document or video in response")
+                task.status = "error"
+                task.error_message = "Не удалось получить file_id"
+                await self._send_error(task)
+                return
+
+            logger.info(f"[Task] Sent to storage, file_id={file_id[:30]}...")
 
             # Добавляем в кэш
             self.video_cache.add(
@@ -1536,14 +1549,27 @@ class QueueManager:
                 disable_notification=True
             )
 
-            if not storage_msg or not storage_msg.document:
-                logger.error(f"[Uniqueize] Failed to send to storage. storage_msg={storage_msg}")
+            # Telegram может вернуть document или video в зависимости от файла
+            if not storage_msg:
+                logger.error(f"[Uniqueize] Failed to send to storage - no response")
                 task.status = "error"
                 task.error_message = "Не удалось отправить видео в storage"
                 await self._send_error(task)
                 return
 
-            unique_file_id = storage_msg.document.file_id
+            # Получаем file_id (может быть document или video)
+            if storage_msg.document:
+                unique_file_id = storage_msg.document.file_id
+            elif storage_msg.video:
+                unique_file_id = storage_msg.video.file_id
+            else:
+                logger.error(f"[Uniqueize] No document or video in response")
+                task.status = "error"
+                task.error_message = "Не удалось получить file_id"
+                await self._send_error(task)
+                return
+
+            logger.info(f"[Uniqueize] Sent to storage, file_id={unique_file_id[:30]}...")
 
             # Формируем caption для пользователя
             user_caption_parts = []
