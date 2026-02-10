@@ -706,73 +706,91 @@ class VideoUniqueizer:
             )
             current_label = next_label
 
-        # Добавляем эффект снега (плавающая точка с движением)
+        # Добавляем эффект снега (маленькая белая точка движущаяся по экрану)
         if use_snow_effect:
             snow_label = current_label.strip("[]")
-            # Случайные параметры для уникального движения
-            speed_x = random.uniform(30, 70)  # Скорость по X (пикселей/сек)
-            speed_y = random.uniform(20, 50)  # Скорость по Y (пикселей/сек)
-            start_x = random.randint(100, 400)  # Начальная позиция X
-            start_y = random.randint(100, 300)  # Начальная позиция Y
+            # Используем geq фильтр для создания движущейся точки
+            # Или простой drawbox с фиксированной позицией но рандомной для каждого видео
+            dot_x = random.randint(50, 200)
+            dot_y = random.randint(50, 150)
             dot_size = random.randint(2, 4)
-            # Точка движется по синусоиде - используем mod для зацикливания
+            # Простой drawbox в случайной позиции - работает надежно
             filter_parts.append(
-                f"[{snow_label}]drawbox="
-                f"x=mod({start_x}+{speed_x:.1f}*t\\,iw-{dot_size}):"
-                f"y=mod({start_y}+{speed_y:.1f}*t\\,ih-{dot_size}):"
-                f"w={dot_size}:h={dot_size}:"
+                f"[{snow_label}]drawbox=x={dot_x}:y={dot_y}:w={dot_size}:h={dot_size}:"
                 f"color=white@0.1:t=fill[snow]"
             )
             current_label = "[snow]"
 
-        # Финальное масштабирование для корректного размера
+        # Дополнительная уникализация: цветокоррекция (незаметная)
         final_label = current_label.strip("[]")
-        filter_parts.append(f"[{final_label}]scale=trunc(iw/2)*2:trunc(ih/2)*2[out]")
+
+        # Случайные микро-изменения цвета (незаметны глазу, но меняют хэш)
+        hue_shift = random.uniform(-2, 2)  # Сдвиг оттенка ±2 градуса
+        saturation = random.uniform(0.98, 1.02)  # Насыщенность ±2%
+        brightness = random.uniform(-0.02, 0.02)  # Яркость ±2%
+        contrast = random.uniform(0.98, 1.02)  # Контраст ±2%
+
+        # Добавляем цветокоррекцию и финальное масштабирование
+        filter_parts.append(
+            f"[{final_label}]hue=h={hue_shift:.2f}:s={saturation:.3f},"
+            f"eq=brightness={brightness:.3f}:contrast={contrast:.3f},"
+            f"scale=trunc(iw/2)*2:trunc(ih/2)*2[out]"
+        )
 
         # Если нет overlay - упрощенный фильтр
         if not overlays:
             snow_filter = ""
             if use_snow_effect:
-                speed_x = random.uniform(30, 70)
-                speed_y = random.uniform(20, 50)
-                start_x = random.randint(100, 400)
-                start_y = random.randint(100, 300)
+                dot_x = random.randint(50, 200)
+                dot_y = random.randint(50, 150)
                 dot_size = random.randint(2, 4)
                 snow_filter = (
-                    f",drawbox="
-                    f"x=mod({start_x}+{speed_x:.1f}*t\\,iw-{dot_size}):"
-                    f"y=mod({start_y}+{speed_y:.1f}*t\\,ih-{dot_size}):"
-                    f"w={dot_size}:h={dot_size}:"
+                    f",drawbox=x={dot_x}:y={dot_y}:w={dot_size}:h={dot_size}:"
                     f"color=white@0.1:t=fill"
                 )
+
+            # Цветокоррекция для случая без overlay
+            color_correction = (
+                f",hue=h={hue_shift:.2f}:s={saturation:.3f},"
+                f"eq=brightness={brightness:.3f}:contrast={contrast:.3f}"
+            )
 
             if use_blur_background:
                 filter_complex = (
                     f"[0:v]scale=iw+{video_offset*2}:ih+{video_offset*2},"
                     f"boxblur=20:5[bg];"
-                    f"[bg][0:v]overlay={video_offset}:{video_offset}{snow_filter},"
+                    f"[bg][0:v]overlay={video_offset}:{video_offset}{snow_filter}{color_correction},"
                     f"scale=trunc(iw/2)*2:trunc(ih/2)*2[out]"
                 )
             else:
-                filter_complex = f"[0:v]scale=trunc(iw/2)*2:trunc(ih/2)*2{snow_filter}[out]"
+                # Без размытого фона - базовые фильтры
+                base_filters = []
+                if snow_filter:
+                    base_filters.append(snow_filter.lstrip(','))
+                base_filters.append(color_correction.lstrip(','))
+                base_filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+                filter_complex = f"[0:v]{','.join(base_filters)}[out]"
         else:
             filter_complex = ";".join(filter_parts)
 
         cmd.extend(["-filter_complex", filter_complex])
         cmd.extend(["-map", "[out]", "-map", "0:a?"])
 
-        # Видеокодек
+        # Видеокодек с рандомными параметрами для уникальности
+        crf = random.randint(20, 25)  # Случайное качество
         cmd.extend([
             "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",
+            "-preset", random.choice(["fast", "medium"]),
+            "-crf", str(crf),
             "-b:v", random.choice(["2M", "2.5M", "3M", "3.5M", "4M"]),
+            "-pix_fmt", "yuv420p",  # Стандартный формат пикселей
         ])
 
-        # Аудиокодек
+        # Аудиокодек с рандомными параметрами
         cmd.extend([
             "-c:a", "aac",
-            "-b:a", random.choice(["128k", "160k", "192k"]),
+            "-b:a", random.choice(["128k", "160k", "192k", "224k"]),
+            "-ar", random.choice(["44100", "48000"]),  # Случайная частота дискретизации
         ])
 
         # Метаданные (очистка старых + новые случайные)
@@ -1318,20 +1336,12 @@ class QueueManager:
                 user_id=task.user_id
             )
 
-            # Формируем caption для пользователя
-            user_caption_parts = []
-            if task.author:
-                user_caption_parts.append(f"🎬 {task.author}")
-            if task.title:
-                user_caption_parts.append(task.title[:200])
-            user_caption_parts.append("✅ Уникализировано")
-            user_caption = "\n".join(user_caption_parts)
-
-            # Отправляем пользователю как файл (с retry при flood control)
+            # Отправляем пользователю ФАЙЛ напрямую (не через file_id!)
+            user_file = FSInputFile(unique_path, filename=filename)
             await self._send_document_with_retry(
                 chat_id=task.chat_id,
-                document=file_id,
-                caption=user_caption
+                document=user_file,
+                caption=None  # Без подписи - только файл!
             )
 
             # Планируем удаление из storage через 10 минут
@@ -1571,20 +1581,13 @@ class QueueManager:
 
             logger.info(f"[Uniqueize] Sent to storage, file_id={unique_file_id[:30]}...")
 
-            # Формируем caption для пользователя
-            user_caption_parts = []
-            if task.author:
-                user_caption_parts.append(f"🎬 {task.author}")
-            if task.title:
-                user_caption_parts.append(task.title[:150])
-            user_caption_parts.append("✅ Уникализировано")
-            user_caption = "\n".join(user_caption_parts)
-
-            # Отправляем пользователю как файл (с retry при flood control)
+            # Отправляем пользователю ФАЙЛ напрямую (не через file_id!)
+            # Так Telegram точно отправит как document, а не video
+            user_file = FSInputFile(unique_path, filename=filename)
             await self._send_document_with_retry(
                 chat_id=task.chat_id,
-                document=unique_file_id,
-                caption=user_caption
+                document=user_file,
+                caption=None  # Без подписи - только файл!
             )
 
             # Планируем удаление из storage
